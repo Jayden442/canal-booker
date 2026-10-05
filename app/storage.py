@@ -240,6 +240,10 @@ def parse_plan_csv(text: str) -> dict:
                     return row[j].strip()
         return ""
 
+    def cols(row, key):
+        """Every column starting with key, in order, as one comma list ("Backup 1", "Backup 2" or "Backup times")."""
+        return ",".join(row[j].strip() for j, n in enumerate(names) if n.startswith(key) and j < len(row) and row[j].strip())
+
     people, order = {}, []
     for row in rows[head + 1:]:
         user = col(row, "username").split("@")[0]
@@ -252,13 +256,14 @@ def parse_plan_csv(text: str) -> dict:
             people[key] = {"name": col(row, "name") or user, "username": user, "slots": [], "rooms": []}
             order.append(key)
         alts = []
-        for part in col(row, "backup").split(","):
+        for part in cols(row, "backup").split(","):
             if "-" in part:
                 a, b = part.split("-", 1)
                 if _norm_time(a) and _norm_time(b):
                     alts.append({"start": _norm_time(a), "end": _norm_time(b)})
-        people[key]["slots"].append({"day": day, "start": start, "end": end, "alts": alts})
-        rooms = [r.strip() for r in col(row, "room").split(",") if r.strip()]
+        # Rooms belong to the row (that day); the person's first rooms are the fallback for rows without any.
+        rooms = list(dict.fromkeys(r.strip() for r in cols(row, "room").split(",") if r.strip()))
+        people[key]["slots"].append({"day": day, "start": start, "end": end, "alts": alts, "rooms": rooms})
         if rooms and not people[key]["rooms"]:
             people[key]["rooms"] = rooms
     plan_rooms = []

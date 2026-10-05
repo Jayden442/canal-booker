@@ -215,7 +215,8 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         return result
     prepare, grab = steps[:cut], steps[cut:]
     times = slot.get("times") or storage.slot_times(slot)
-    options = [(r, t) for r in settings["rooms"] for t in times][:MAX_RACE_TABS]
+    rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
+    options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
     poll = int(settings.get("race_poll_ms", 1500)) / 1000
     window = int(settings.get("race_window_seconds", 120))
     base = _base_ctx(settings, password)
@@ -332,7 +333,8 @@ def run_bookings(settings, password, recipe, targets, dry_run=False):
             tried = []
             # First room at each time in order, then the next room, and so on.
             times = slot.get("times") or storage.slot_times(slot)
-            for room, (start_text, end_text) in [(r, t) for r in settings["rooms"] for t in times]:
+            rooms = slot.get("rooms") or settings["rooms"]
+            for room, (start_text, end_text) in [(r, t) for r in rooms for t in times]:
                 label = f"{room} {start_text}-{end_text}"
                 ctx = _ctx(base, recipe, day, room, start_text, end_text)
                 try:

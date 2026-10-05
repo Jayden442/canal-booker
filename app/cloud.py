@@ -71,7 +71,8 @@ def settings_from_env():
     s["rooms"] = rooms or me.get("rooms") or plan.get("rooms") or []
     if not s["rooms"]:
         return None, None, "No rooms. Fill in the Rooms column in the sheet, or set the ROOMS variable."
-    s["slots"] = [dict(x, enabled=True) for x in me["slots"]]
+    # A ROOMS override (variable or Run workflow box) wins over each day's rooms in the plan.
+    s["slots"] = [dict(x, enabled=True, **({"rooms": []} if rooms else {})) for x in me["slots"]]
     return s, password, None
 
 
@@ -112,7 +113,7 @@ def book(s, password, recipe):
     if not slot:
         summary(f"No slot on {day:%a %b %d}", "Your row for that day was removed from the team plan.")
         return 0
-    log(f"Rooms: {', '.join(s['rooms'])}. Times: {', '.join(a + '-' + b for a, b in slot['times'])}.")
+    log(f"Rooms: {', '.join(slot.get('rooms') or s['rooms'])}. Times: {', '.join(a + '-' + b for a, b in slot['times'])}.")
 
     result = booker.race_booking(s, password, recipe, day, slot, open_at)
     log(result["message"])
@@ -157,7 +158,7 @@ def test(s, password, recipe):
         if not slot or (only and day.isoformat() not in only):
             continue
         tried += 1
-        log(f"Test (dry run) on {day:%a %b %d}. Rooms: {', '.join(s['rooms'])}.")
+        log(f"Test (dry run) on {day:%a %b %d}. Rooms: {', '.join(slot.get('rooms') or s['rooms'])}.")
         result = booker.race_booking(s, password, recipe, day, slot, dt.datetime.now(TZ), dry_run=True)
         log(result["message"])
         if result["status"] == "dry_run":

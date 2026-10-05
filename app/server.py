@@ -51,7 +51,9 @@ def validate(body: dict) -> dict:
                 _check_times(day, a_start, a_end)
                 if (a_start, a_end) != (start, end) and {"start": a_start, "end": a_end} not in alts:
                     alts.append({"start": a_start, "end": a_end})
+            slot_rooms = [str(r).strip() for r in x.get("rooms") or [] if str(r).strip()]
             slots.append({"day": day, "start": start, "end": end, "alts": alts[:5],
+                          "rooms": list(dict.fromkeys(slot_rooms))[:5],  # that day's rooms from the plan
                           "enabled": bool(x.get("enabled", True))})
         out["slots"] = sorted(slots, key=lambda s: storage.DAYS.index(s["day"]))
     if "book_time" in body:

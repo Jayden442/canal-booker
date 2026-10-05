@@ -22,7 +22,114 @@ function setup() {
   var ss = SpreadsheetApp.getActive();
   makeGuide_(ss);
   makeStatus_(ss);
-  SpreadsheetApp.getActive().toast('Setup guide and Status tabs are ready.');
+  setupDropdowns();
+  SpreadsheetApp.getActive().toast('Setup guide, Status tab and dropdowns are ready.');
+}
+
+/** Adds a Canal Booker menu to the sheet, so the organizer can redo the dropdowns without opening the script. */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Canal Booker')
+    .addItem('Set up dropdowns', 'setupDropdowns')
+    .addToUi();
+}
+
+var ROOMS = ['CB 2103', 'CB 2302', 'CB 3102', 'CB 3201', 'CB 3208'];
+var DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+var PLAN_HEADERS = ['Name', 'Username', 'Day', 'Start', 'End', 'Backup 1', 'Backup 2', 'Room 1', 'Room 2', 'Room 3'];
+var PLAN_ROWS = 200;
+
+/**
+ * Turns the plan tab into dropdowns: Day, Start, End, two backup times and three rooms in order.
+ * An older plan (Backup times / Rooms (in order) typed as lists) is converted first, keeping every value.
+ * Safe to run again.
+ */
+function setupDropdowns() {
+  var found = findPlan_();
+  if (!found) {
+    SpreadsheetApp.getActive().toast('No plan tab found (a row with Username and Day).');
+    return;
+  }
+  var sh = found.sheet, head = found.row; // head is 1-based
+  var lastCol = Math.max(sh.getLastColumn(), PLAN_HEADERS.length);
+  var lastRow = Math.max(sh.getLastRow(), head);
+  var header = sh.getRange(head, 1, 1, lastCol).getDisplayValues()[0].map(function (v) { return String(v).trim().toLowerCase(); });
+  var data = lastRow > head ? sh.getRange(head + 1, 1, lastRow - head, lastCol).getDisplayValues() : [];
+
+  function pick(row, prefix) {
+    var out = [];
+    header.forEach(function (h, j) {
+      if (h.indexOf(prefix) === 0 && row[j]) {
+        String(row[j]).split(',').forEach(function (p) { if (p.trim()) out.push(p.trim()); });
+      }
+    });
+    return out;
+  }
+  function first(row, prefix) {
+    var j = header.findIndex(function (h) { return h.indexOf(prefix) === 0; });
+    return j < 0 ? '' : String(row[j]).trim();
+  }
+  function hhmm(t) {
+    var m = String(t).trim().match(/^(\d{1,2}):(\d{2})/);
+    return m ? ('0' + m[1]).slice(-2) + ':' + m[2] : String(t).trim();
+  }
+
+  var rows = data.filter(function (r) { return r.join('').trim(); }).map(function (r) {
+    var backups = pick(r, 'backup').map(function (b) { return b.split('-').map(hhmm).join('-'); });
+    var rooms = pick(r, 'room');
+    return [first(r, 'name'), first(r, 'username'), first(r, 'day').substring(0, 3), hhmm(first(r, 'start')),
+            hhmm(first(r, 'end')), backups[0] || '', backups[1] || '', rooms[0] || '', rooms[1] || '', rooms[2] || ''];
+  });
+
+  // Rewrite the header and the rows in the new layout.
+  sh.getRange(head, 1, Math.max(lastRow - head + 1, 1), lastCol).clearDataValidations().clearContent();
+  sh.getRange(head, 1, 1, PLAN_HEADERS.length).setValues([PLAN_HEADERS])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange(head + 1, 3, PLAN_ROWS, 8).setNumberFormat('@'); // keep 12:00 as text, not a date
+  if (rows.length) sh.getRange(head + 1, 1, rows.length, PLAN_HEADERS.length).setValues(rows);
+
+  var times = [];
+  for (var m = 7 * 60; m <= 23 * 60; m += 30) times.push(('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + m % 60).slice(-2));
+  var ranges = [];
+  for (var s = 7 * 60; s < 23 * 60; s += 30) {
+    for (var len = 60; len <= 180; len += 30) {
+      if (s + len <= 23 * 60) ranges.push(times[(s - 420) / 30] + '-' + times[(s + len - 420) / 30]);
+    }
+  }
+  function list(values, help) {
+    return SpreadsheetApp.newDataValidation().requireValueInList(values, true).setAllowInvalid(false)
+      .setHelpText(help).build();
+  }
+  sh.getRange(head + 1, 3, PLAN_ROWS, 1).setDataValidation(list(DAYS, 'Pick a day.'));
+  sh.getRange(head + 1, 4, PLAN_ROWS, 2).setDataValidation(list(times, 'Pick a time. At most 3 hours from Start to End.'));
+  sh.getRange(head + 1, 6, PLAN_ROWS, 2).setDataValidation(list(ranges, 'Optional. Tried if the main time is taken.'));
+  sh.getRange(head + 1, 8, PLAN_ROWS, 3).setDataValidation(list(ROOMS, 'Optional. Room 1 is tried first.'));
+
+  var widths = [120, 120, 70, 80, 80, 120, 120, 100, 100, 100];
+  for (var i = 0; i < widths.length; i++) sh.setColumnWidth(i + 1, widths[i]);
+  if (head > 4) { // rows 1-4 are the instructions above the header
+    sh.getRange(1, 1, 4, 1).setValues([
+      ['Canal Booker team plan. One row per person per day. At most 3 hours a day.'],
+      ['Type your Name and Username (your MyCarletonOne username, before @carleton.ca). Pick everything else from the dropdowns.'],
+      ['Backup 1 and 2 are tried in order if the main time is taken. Room 1 is tried first, then Room 2, then Room 3 (all your times in a room before the next room).'],
+      ['Leave the rooms blank to use your other rows\' rooms. Do not rename the header row below.'],
+    ]);
+  }
+  SpreadsheetApp.getActive().toast('Dropdowns are ready on the "' + sh.getName() + '" tab.');
+}
+
+/** The tab with the plan: the first one with a row containing Username and Day. */
+function findPlan_() {
+  var sheets = SpreadsheetApp.getActive().getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    var name = sheets[i].getName();
+    if (name === STATUS || name === GUIDE) continue;
+    var values = sheets[i].getRange(1, 1, Math.min(Math.max(sheets[i].getLastRow(), 1), 30), Math.max(sheets[i].getLastColumn(), 1)).getDisplayValues();
+    for (var r = 0; r < values.length; r++) {
+      var low = values[r].map(function (v) { return String(v).trim().toLowerCase(); });
+      if (low.indexOf('username') >= 0 && low.indexOf('day') >= 0) return { sheet: sheets[i], row: r + 1 };
+    }
+  }
+  return null;
 }
 
 function makeGuide_(ss) {
@@ -34,9 +141,9 @@ function makeGuide_(ss) {
     ['Canal Booker books your Canal Building study room the second it opens (midnight, one week ahead), under your own Carleton account. Your rooms and times come from the plan tab in this sheet.'],
     [''],
     ['# Step 1: add your rows to the plan tab (everyone)'],
-    ['One row per day you want. Username = your MyCarletonOne username (the part before @carleton.ca). Day = Mon to Sun. Start and End in 24 hour time, like 12:00 and 15:00. At most 3 hours a day.'],
-    ['Backup times (optional): tried in order if the main time is taken, like 09:00-12:00, 15:00-18:00. Rooms (optional): in order of preference, like CB 2103, CB 2302.'],
-    ['Do not rename the header row (Name, Username, Day, Start, End, Backup times, Rooms). Changes are picked up by the next night\'s run.'],
+    ['One row per day you want. Type your Name and Username (your MyCarletonOne username, the part before @carleton.ca); pick Day, Start and End from the dropdowns. At most 3 hours a day.'],
+    ['Backup 1 and Backup 2 (optional) are tried in order if the main time is taken. Room 1 to Room 3 (optional) are your rooms for that day in order of preference; every time is tried in Room 1 before Room 2.'],
+    ['Do not rename the header row. Changes count if made before about 11:55 pm; the bot re-reads the sheet just before midnight.'],
     [''],
     ['# Step 2, option A: run it in the cloud (recommended, your computer can be off)'],
     ['1. Make a free GitHub account if you do not have one, and sign in.'],
