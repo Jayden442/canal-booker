@@ -107,6 +107,7 @@ def save_settings(new: dict) -> dict:
         s = load_settings()
         s.update({k: v for k, v in new.items() if k in DEFAULT_SETTINGS})
         _write_json(data_dir() / "settings.json", s)
+        print(s)
         return s
 
 

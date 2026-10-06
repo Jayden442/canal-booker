@@ -217,6 +217,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
     times = slot.get("times") or storage.slot_times(slot)
     rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
     options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
+    print(options)
     poll = int(settings.get("race_poll_ms", 1500)) / 1000
     window = int(settings.get("race_window_seconds", 120))
     base = _base_ctx(settings, password)
