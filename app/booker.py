@@ -58,6 +58,8 @@ def _scrub(text, secret):
 
 # Tabs that are not in front are slowed down by the browser (timers and animation frames), which
 # made every click in them take a second or two. Midnight mode keeps up to 6 tabs open, so turn that off.
+# Seconds around the open time at which the tabs make their first reload (cycled across tabs).
+STAGGER = (0.0, -0.1, 0.1)  # the first choice reloads right on time
 BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
 
@@ -351,7 +353,11 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         # Near the open time each waiting tab reloads again as soon as the last reload could be back.
         reload_s = _measure_reload(tabs[0]["page"], refresh, tabs[0]["ctx"])
         rapid = max(0.3, reload_s)
-        next_fire = time.time()  # first reload now (3 s early), the next one right at the open time
+        # First reload now (3 s early). The reload right at the open time is spread across the tabs
+        # (0.1 s early, on time, 0.1 s late, and so on) so a small clock error doesn't cost a full
+        # extra reload: whichever tab lands first just after the opening sees the day.
+        for t in tabs:
+            t["next"] = time.time()
         sync = f"Portal clock {offset:+.2f} s from ours; calendar reload {reload_s:.2f} s."
 
         def is_ready(t):
@@ -360,27 +366,34 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             except Exception:  # the page is mid-reload
                 return False
 
+        def fire(t, now):
+            # Never click again while this tab's last reload is still loading (that would
+            # cancel it), unless it has been stuck for 2.5 s.
+            if t["alive"] and not is_ready(t) and (
+                    not _reloading(t["page"]) or now - t.get("fired", 0) > 2.5):
+                _fire(t["page"], refresh, t["ctx"])
+                t["fired"] = now
+
         while time.time() < deadline and any(t["alive"] for t in tabs):
             now = time.time()
-            if now >= next_fire:
-                # Reload every waiting tab's calendar at the same time instead of one after another.
-                for t in tabs:
-                    # Never click again while this tab's last reload is still loading (that would
-                    # cancel it), unless it has been stuck for 2.5 s.
-                    if t["alive"] and not is_ready(t) and (
-                            not _reloading(t["page"]) or now - t.get("fired", 0) > 2.5):
-                        _fire(t["page"], refresh, t["ctx"])
-                        t["fired"] = now
-                if now < open_local:
-                    next_fire = open_local + 0.05
+            for i, t in enumerate(tabs):
+                if now < t["next"]:
+                    continue
+                fire(t, now)
+                if now < open_local - 0.5:
+                    t["next"] = open_local + STAGGER[i % len(STAGGER)]
                 elif now < open_local + 8:
-                    next_fire = now + rapid  # the first seconds after opening: reload again quickly
+                    t["next"] = now + rapid  # the first seconds after opening: reload again quickly
                 else:
-                    next_fire = now + poll
+                    t["next"] = now + poll
             ready = [t for t in tabs if t["alive"] and is_ready(t)]
             if not ready:
-                first.wait_for_timeout(100)
+                first.wait_for_timeout(100 if min(t["next"] for t in tabs) - time.time() > 0.1 else 20)
                 continue
+            # The day is open: every other tab still showing the old calendar reloads right away.
+            for o in tabs:
+                if o not in ready:
+                    fire(o, time.time())
             if ready[0] is not next(t for t in tabs if t["alive"]):
                 # A lower choice opened first; give better choices still reloading a moment to catch up.
                 first.wait_for_timeout(250)
@@ -446,12 +459,18 @@ def _calendar_seen(tabs, day):
     return "Calendar check: no page to read."
 
 
-def trace_booking(settings, password, recipe, day, slot):
+# Requests whose full form and answer the trace logs (the start-time list and the Book form).
+TRACE_FULL = ("SelfServiceRoomAvailability", "ConfirmBooking")
+
+
+def trace_booking(settings, password, recipe, day, slot, probe_day=None):
     """Dry run of one choice that records the portal's traffic after sign-in: every request
     (method, address, form fields) and response (status, type, size, start of the body), with
     the time since the step began. Used to find out which requests the calendar and the
     start-time list really make. Sign-in is not recorded, and headers and cookies never are;
-    the username and name are replaced. Returns (events, outcome text)."""
+    the username and name are replaced. With probe_day, it then asks for that day's start-time
+    list directly (the same request, only the date changed) to see what the portal answers for
+    a day that is not open yet. Nothing is booked. Returns (events, outcome text)."""
     from playwright.sync_api import sync_playwright
     steps = recipe.get("book", [])
     times = slot.get("times") or storage.slot_times(slot)
@@ -466,13 +485,17 @@ def trace_booking(settings, password, recipe, day, slot):
             text = text.replace(s, "<user>" if s != settings.get("_name") else "<name>")
         return text
 
-    events, current = [], {"step": "", "t0": time.time()}
+    events, current, captured = [], {"step": "", "t0": time.time()}, {}
 
     def on_request(req):
         if req.resource_type in ("image", "font", "stylesheet", "media"):
             return
+        full = any(k in req.url for k in TRACE_FULL)
+        if full and req.method == "POST" and "SelfServiceRoomAvailability" in req.url:
+            captured["list"] = (req.url, req.post_data)
         events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  -> {req.method} "
-                      f"{clean(req.url, 160)}" + (f"  form: {clean(req.post_data, 300)}" if req.post_data else ""))
+                      f"{clean(req.url, 160)}" + (f"  form: {clean(req.post_data, 3000 if full else 300)}"
+                                                  if req.post_data else ""))
 
     def on_response(resp):
         req = resp.request
@@ -484,7 +507,8 @@ def trace_booking(settings, password, recipe, day, slot):
             body = ""
         events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  <- {resp.status} "
                       f"{req.resource_type} {len(body)} chars  {clean(req.url, 100)}"
-                      + (f"  body: {clean(body, 200)}" if body else ""))
+                      + (f"  body: {clean(body, 8000 if 'SelfServiceRoomAvailability' in req.url else 200)}"
+                         if body else ""))
 
     with sync_playwright() as p:
         browser = _launch(p, settings.get("show_browser"))
@@ -507,6 +531,17 @@ def trace_booking(settings, password, recipe, day, slot):
                 outcome = f"stopped at '{_step_label(e)}' ({_scrub(e.detail, password)})"
                 break
         page.wait_for_timeout(500)
+        if probe_day and "list" in captured:
+            url, form = captured["list"]
+            form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(probe_day.timetuple())}", form)
+            current.update(step=f"Probe: list for {probe_day:%b %d}", t0=time.time())
+            try:
+                page.evaluate("""([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                              'X-Requested-With': 'XMLHttpRequest'}}).then(r => r.text())""", [url, form])
+                page.wait_for_timeout(300)
+            except Exception as e:
+                events.append(f"[probe] failed: {clean(e, 200)}")
         browser.close()
     return events, f"Traced {room} {start_text}-{end_text} on {day:%a %b %d}: {outcome}."
 

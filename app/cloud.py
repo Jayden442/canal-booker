@@ -232,7 +232,9 @@ def trace(s, password, recipe):
         summary("Nothing to trace", "No row in the team plan to trace with.")
         return 0
     log(f"Tracing the portal's traffic on {day:%a %b %d}. Sign-in is not recorded; names are replaced.")
-    events, outcome = booker.trace_booking(s, password, recipe, day, slot)
+    # Also ask for the start-time list of the first day that is not open yet (read only).
+    probe = today + dt.timedelta(days=int(s["days_ahead"]) + 1)
+    events, outcome = booker.trace_booking(s, password, recipe, day, slot, probe_day=probe)
     for line in events:
         print(line, flush=True)
     summary("🔎 Trace done", f"{outcome} {len(events)} requests and responses recorded; they are in the run log.")
