@@ -59,8 +59,8 @@ def _scrub(text, secret):
 
 # Tabs that are not in front are slowed down by the browser (timers and animation frames), which
 # made every click in them take a second or two. Midnight mode keeps up to 6 tabs open, so turn that off.
-# Seconds around the open time at which the tabs ask again. A tab that skips the calendar asks at
-# each of these moments; calendar tabs take one each, in turn (the first choice right on time).
+# Seconds around the open time at which the tabs first ask again, taken in turn (the first choice
+# right on time). Each tab then asks again as soon as its answer is back.
 STAGGER = (0.0, -0.1, 0.1)
 BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
@@ -395,8 +395,22 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
 
         open_local = open_at.timestamp() - offset
         tabs = []
+        own = 1  # tabs with a sign-in of their own
         for i, (room, (start_text, end_text)) in enumerate(options):
-            page = first if i == 0 else context.new_page()
+            page = first if i == 0 else None
+            if page is None:
+                # The portal answers one sign-in's requests one at a time, so each tab signs in
+                # separately (a browser context of its own) and its requests run side by side with
+                # the others'. If a sign-in fails, the tab shares the first one.
+                try:
+                    own_page = browser.new_context().new_page()
+                    if _login(own_page, recipe, base, password)[0]:
+                        page, own = own_page, own + 1
+                    else:
+                        own_page.context.close()
+                except Exception:
+                    pass
+                page = page or context.new_page()
             ctx = _ctx(base, recipe, day, room, start_text, end_text)
             label = f"{room} {start_text}-{end_text}"
             listener = _capture(direct, ctx)
@@ -469,7 +483,8 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
 
         def direct_note():
             used = sum(1 for t in tabs if t["direct"])
-            text = (f" Start-time list asked for directly (calendar skipped) on {used} of {len(tabs)} tabs."
+            text = f" {own} sign-in{'s' if own > 1 else ''} for {len(tabs)} tab{'s' if len(tabs) > 1 else ''}."
+            text += (f" Start-time list asked for directly (calendar skipped) on {used} of {len(tabs)} tabs."
                     if used else " Calendar used." if switched
                     else " Calendar used (the direct start-time list was not set up).")
             if switched:
@@ -477,8 +492,9 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             return text
 
         def busy(t):
-            # Direct requests don't cancel each other: up to 3 may be on their way at once.
-            return t.get("pending", 0) >= 3 if t["direct"] else _reloading(t["page"])
+            # One request at a time per tab: the portal would only queue a second one, and a Book
+            # click must not wait behind it.
+            return t.get("pending", 0) >= 1 if t["direct"] else _reloading(t["page"])
 
         def fire(t, now):
             # Never ask again while this tab's last request is still on its way (that would cancel
@@ -502,13 +518,9 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                     t["next"] = now + 0.02  # still waiting on the last answer: ask again once it is back
                     continue
                 if now < open_local - 0.5:
-                    # Direct tabs ask at every moment around the open time; a calendar tab can only
-                    # reload once at a time, so the moments are spread across the calendar tabs.
-                    offsets = sorted(STAGGER) if t["direct"] else [STAGGER[i % len(STAGGER)]]
-                    t["plan"] = [open_local + o for o in offsets]
-                    t["next"] = t["plan"].pop(0)
-                elif t.get("plan"):
-                    t["next"] = t["plan"].pop(0)
+                    t["next"] = open_local + STAGGER[i % len(STAGGER)]
+                elif t["direct"] and now < open_local + 8:
+                    t["next"] = now  # ask again as soon as the answer is back (one at a time)
                 elif now < open_local + 8:
                     t["next"] = now + rapid  # the first seconds after opening: reload again quickly
                 else:
