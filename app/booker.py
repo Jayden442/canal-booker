@@ -30,6 +30,7 @@ import datetime as dt
 import email.utils
 import re
 import time
+import urllib.parse
 
 from . import storage
 
@@ -58,8 +59,9 @@ def _scrub(text, secret):
 
 # Tabs that are not in front are slowed down by the browser (timers and animation frames), which
 # made every click in them take a second or two. Midnight mode keeps up to 6 tabs open, so turn that off.
-# Seconds around the open time at which the tabs make their first reload (cycled across tabs).
-STAGGER = (0.0, -0.1, 0.1)  # the first choice reloads right on time
+# Seconds around the open time at which the tabs ask again. A tab that skips the calendar asks at
+# each of these moments; calendar tabs take one each, in turn (the first choice right on time).
+STAGGER = (0.0, -0.1, 0.1)
 BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
 
@@ -185,6 +187,79 @@ def _measure_reload(page, steps, ctx, limit=5.0):
     return time.time() - started
 
 
+# Skipping the calendar (recipe race.direct): each tab asks for its start-time list straight away,
+# the same request the portal makes when a date is picked, and books from the answer.
+_DIRECT_FIRE = """([u, f, marker, secs]) => {
+  const s = window.__cbList = window.__cbList || {pending: 0, state: 'none', odd: 0};
+  const read = t => {
+    if (!t || !t.includes(marker)) return 'odd';
+    const d = new DOMParser().parseFromString(t, 'text/html');
+    for (const div of d.querySelectorAll('.listDiv')) {
+      let data; try { data = JSON.parse(div.getAttribute('data-listData')); } catch (e) { continue; }
+      for (const row of (data.RowData || [])) {
+        const cells = row.rowData || [];
+        if (Array.isArray(cells[0]) && Number(cells[0][1]) === secs && String(cells[1]).includes('Book')) {
+          const box = document.createElement('div'); box.id = 'cb-direct'; box.innerHTML = cells[1];
+          if (box.querySelector('input')) { document.body.appendChild(box); return 'ready'; }
+        }
+      }
+    }
+    return 'closed';
+  };
+  s.pending++;
+  fetch(u, {method: 'POST', body: f, credentials: 'include', headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
+    .then(r => r.text()).catch(() => '').then(t => {
+      s.pending--;
+      if (s.state === 'ready') return;
+      const state = read(t);
+      s.odd = state === 'odd' ? s.odd + 1 : 0;
+      if (state !== 'odd' || s.odd >= 3) s.state = state;
+    }); }"""
+# The state of the answers so far: 'ready' (the Book button for this start time is on the page, in
+# #cb-direct), 'pending' (no answer yet), 'closed' (no such start time yet), 'odd' (three answers in
+# a row that were not a start-time list) or 'none'. Also how many requests are still on their way.
+_DIRECT_STATE = """() => { const s = window.__cbList;
+  if (document.querySelector('#cb-direct input')) return ['ready', 0];
+  if (!s) return ['none', 0];
+  return [s.state === 'none' && s.pending ? 'pending' : s.state, s.pending]; }"""
+
+
+def _direct_state(page):
+    """(state, requests still on their way); see _DIRECT_STATE."""
+    try:
+        return tuple(page.evaluate(_DIRECT_STATE))
+    except Exception:  # the page is between documents
+        return "pending", 1
+
+
+def _direct_fire(page, direct, ctx):
+    """Ask for the start-time list without waiting for the answer. Unlike a calendar reload, a new
+    request does not cancel the last one, so several can be on their way at once."""
+    try:
+        page.evaluate(_DIRECT_FIRE, [direct["url"], _render(direct["form"], ctx),
+                                     direct.get("answer_marker", ""), ctx["start_min"] * 60])
+    except Exception:
+        pass
+
+
+def _capture(direct, ctx):
+    """A request listener that copies the fields named in direct.capture (the room's id and the
+    booking type's id) from the portal's calendar request into ctx."""
+    cap = direct.get("capture") or {}
+
+    def on_request(req):
+        try:
+            if cap.get("url") and cap["url"] in req.url and req.post_data:
+                form = urllib.parse.parse_qs(req.post_data, keep_blank_values=True)
+                for key, field in (cap.get("fields") or {}).items():
+                    if form.get(field) and form[field][0]:
+                        ctx[key] = form[field][0]
+        except Exception:
+            pass
+    return on_request
+
+
 def _step_label(err: StepFailed):
     return err.step.get("note") or f"{err.step.get('action')} {err.step.get('selector', err.step.get('url', ''))}"
 
@@ -292,6 +367,11 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         result.update(status="error", message="This version of the booking steps has no midnight mode.")
         return result
     prepare, grab = steps[:cut], steps[cut:]
+    # Skipping the calendar: book with direct.grab, then the normal steps from direct.then on.
+    direct = race.get("direct") or {}
+    then = next((i for i, s in enumerate(grab) if direct.get("then") and
+                 (s.get("note") or "").startswith(direct["then"])), None)
+    direct_grab = (direct.get("grab", []) + grab[then:]) if then is not None and direct.get("url") else []
     times = slot.get("times") or storage.slot_times(slot)
     rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
     options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
@@ -317,11 +397,15 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             page = first if i == 0 else context.new_page()
             ctx = _ctx(base, recipe, day, room, start_text, end_text)
             label = f"{room} {start_text}-{end_text}"
+            listener = _capture(direct, ctx)
+            page.on("request", listener)
             for attempt in range(PREPARE_TRIES):
                 try:
                     run_steps(page, prepare, ctx, settle=True)
                     tabs.append({"page": page, "ctx": ctx, "label": label, "room": room,
-                                 "time": f"{start_text}-{end_text}", "alive": True})
+                                 "time": f"{start_text}-{end_text}", "alive": True,
+                                 "direct": bool(direct_grab) and all(
+                                     k in ctx for k in (direct.get("capture") or {}).get("fields", {}))})
                     break
                 except StepFailed as e:
                     # Start the tab over from the first page, unless the open time is under
@@ -331,6 +415,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                     notes.append(f"{label} could not get ready at '{_step_label(e)}' "
                                  f"({_scrub(e.detail, password)})")
                     _shot(page, f"{day}_race_prepare_{room}_{start_text}")
+            page.remove_listener("request", listener)
         if not tabs:
             result.update(status="error", message="Midnight mode: no choice got ready. " + "; ".join(notes),
                           screenshot=_shot(first, f"{day}_race_prepare_failed"))
@@ -356,32 +441,67 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         # First reload now (3 s early). The reload right at the open time is spread across the tabs
         # (0.1 s early, on time, 0.1 s late, and so on) so a small clock error doesn't cost a full
         # extra reload: whichever tab lands first just after the opening sees the day.
+        switched = []  # tabs whose direct answer looked wrong and went back to the calendar
         for t in tabs:
             t["next"] = time.time()
+            t["state"] = "none"
         sync = f"Portal clock {offset:+.2f} s from ours; calendar reload {reload_s:.2f} s."
 
         def is_ready(t):
+            if t["direct"]:
+                state, t["pending"] = _direct_state(t["page"])
+                t["state"] = state
+                if state == "odd":  # not a start-time list: use the calendar for this tab from now on
+                    t["direct"] = False
+                    switched.append(t["label"])
+                return state == "ready"
             try:
                 return t["page"].locator(_render(ready_sel, t["ctx"])).count() > 0
             except Exception:  # the page is mid-reload
                 return False
 
+        def direct_note():
+            used = sum(1 for t in tabs if t["direct"])
+            text = (f" Start-time list asked for directly (calendar skipped) on {used} of {len(tabs)} tabs."
+                    if used else " Calendar used." if switched
+                    else " Calendar used (the direct start-time list was not set up).")
+            if switched:
+                text += f" Went back to the calendar for: {', '.join(switched)}."
+            return text
+
+        def busy(t):
+            # Direct requests don't cancel each other: up to 3 may be on their way at once.
+            return t.get("pending", 0) >= 3 if t["direct"] else _reloading(t["page"])
+
         def fire(t, now):
-            # Never click again while this tab's last reload is still loading (that would
-            # cancel it), unless it has been stuck for 2.5 s.
-            if t["alive"] and not is_ready(t) and (
-                    not _reloading(t["page"]) or now - t.get("fired", 0) > 2.5):
-                _fire(t["page"], refresh, t["ctx"])
+            # Never ask again while this tab's last request is still on its way (that would cancel
+            # a calendar reload), unless it has been stuck for 2.5 s. Returns True if it asked.
+            if t["alive"] and not is_ready(t) and (not busy(t) or now - t.get("fired", 0) > 2.5):
+                if t["direct"]:
+                    _direct_fire(t["page"], direct, t["ctx"])
+                    t["pending"] = t.get("pending", 0) + 1
+                else:
+                    _fire(t["page"], refresh, t["ctx"])
                 t["fired"] = now
+                return True
+            return False
 
         while time.time() < deadline and any(t["alive"] for t in tabs):
             now = time.time()
             for i, t in enumerate(tabs):
                 if now < t["next"]:
                     continue
-                fire(t, now)
+                if not fire(t, now) and now >= open_local - 0.5:
+                    t["next"] = now + 0.02  # still waiting on the last answer: ask again once it is back
+                    continue
                 if now < open_local - 0.5:
-                    t["next"] = open_local + STAGGER[i % len(STAGGER)]
+                    # Direct tabs ask at every moment around the open time; a calendar tab can only
+                    # reload once at a time, so the moments are spread across the calendar tabs.
+                    offsets = sorted(STAGGER) if t["direct"] else [STAGGER[i % len(STAGGER)]]
+                    t["plan"] = [open_local + o for o in offsets]
+                    t["next"] = t["plan"].pop(0)
+                elif t.get("plan"):
+                    t["next"] = t["plan"].pop(0)
                 elif now < open_local + 8:
                     t["next"] = now + rapid  # the first seconds after opening: reload again quickly
                 else:
@@ -402,12 +522,13 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             try:
                 t["page"].bring_to_front()  # a tab in front is not slowed down by the browser
                 steps_timed = []
-                outcome = run_steps(t["page"], grab, t["ctx"], dry_run=dry_run, timings=steps_timed)
+                outcome = run_steps(t["page"], direct_grab if t["direct"] else grab, t["ctx"],
+                                    dry_run=dry_run, timings=steps_timed)
                 when = _when()
                 shot = _shot(t["page"], f"{day}_race_{t['room']}_{outcome}")
                 # Say what happened to the choices tried before this one (taken by someone else, and when).
                 before = f" Before that: {'; '.join(notes)}." if notes else ""
-                timing = f" {sync} Step times: {_timing_text(steps_timed)}."
+                timing = f" {sync}{direct_note()} Step times: {_timing_text(steps_timed)}."
                 if outcome == "dry_run":
                     result.update(room=t["room"], time=t["time"], status="dry_run", screenshot=shot,
                                   message=f"Midnight mode dry run: {t['label']} was free {when}. Nothing was booked.{before}{timing}")
@@ -425,7 +546,9 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                                                  else f"failed at '{_step_label(e)}' {_when()}"))
         if notes:
             result["message"] += " " + "; ".join(notes) + "."
-        result["message"] += " " + _calendar_seen(tabs, day) + " " + sync
+        last = "; ".join(f"{t['label']}: {t['state']}" for t in tabs if t["direct"])
+        result["message"] += (" " + _calendar_seen(tabs, day) + " " + sync + direct_note()
+                              + (f" Last direct answers: {last}." if last else ""))
         result["screenshot"] = _shot(tabs[0]["page"], f"{day}_race_nothing_booked")
         browser.close()
     return result
