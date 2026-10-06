@@ -672,6 +672,41 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                 page.wait_for_timeout(300)
             except Exception as e:
                 events.append(f"[probe] failed: {clean(e, 200)}")
+        direct = (recipe.get("race") or {}).get("direct") or {}
+        cut = next((i for i, s in enumerate(steps) if s.get("race_start")), None)
+        then = next((i for i, s in enumerate(steps) if direct.get("then") and
+                     (s.get("note") or "").startswith(direct["then"])), None)
+        if direct.get("url") and cut is not None and then is not None:
+            # The same choice again, skipping the calendar the way midnight mode does.
+            outcome += " Then skipping the calendar:"
+            dctx = _ctx(base, recipe, day, room, start_text, end_text)
+            page.on("request", _capture(direct, dctx))
+            try:
+                for step in steps[:cut]:
+                    current.update(step="Direct: " + (step.get("note") or step.get("action")), t0=time.time())
+                    run_steps(page, [step], dctx, settle=True)
+                page.wait_for_timeout(500)
+                missing = [k for k in (direct.get("capture") or {}).get("fields", {}) if k not in dctx]
+                if missing:
+                    raise StepFailed("error", 0, {"note": "Read the room ids"}, f"not seen: {', '.join(missing)}")
+                current.update(step="Direct: ask for the list", t0=time.time())
+                _direct_fire(page, direct, dctx)
+                state = "pending"
+                while state in ("pending", "none") and time.time() - current["t0"] < 5:
+                    page.wait_for_timeout(20)
+                    state = _direct_state(page)[0]
+                events.append(f"[Direct: ask for the list   ] +{time.time() - current['t0']:5.2f}s  answer: {state}")
+                outcome += f" list answer '{state}'"
+                if state == "ready":
+                    for step in direct.get("grab", []) + steps[then:]:
+                        current.update(step="Direct: " + (step.get("note") or step.get("action")), t0=time.time())
+                        if run_steps(page, [step], dctx, dry_run=True) == "dry_run":
+                            outcome += ", stopped before the final OK (nothing booked)"
+                            break
+                        events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  step done")
+            except StepFailed as e:
+                outcome += f" stopped at '{_step_label(e)}' ({_scrub(e.detail, password)})"
+            page.wait_for_timeout(500)
         browser.close()
     return events, f"Traced {room} {start_text}-{end_text} on {day:%a %b %d}: {outcome}."
 
