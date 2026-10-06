@@ -707,6 +707,21 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                                      [direct["url"], _render(direct["form"], dctx)])
                 events.append(f"[Direct: 6 lists at once    ] answers after (ms): {sorted(took)}")
                 outcome += f"; 6 lists at once answered after {sorted(took)} ms"
+                # One request for a wide window (7:00 to 23:00): which start times come back, for each
+                # of the next 8 days (read only)? Shows "open", "open but taken" and "not open yet".
+                wide = dict(dctx, start_min=420, end_min=1380)
+                for k in range(8):
+                    d = dt.date.today() + dt.timedelta(days=k)
+                    form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(d.timetuple())}",
+                                  _render(direct["form"], wide))
+                    text = page.evaluate("""([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                  'X-Requested-With': 'XMLHttpRequest'}}).then(r => r.text())""",
+                                         [direct["url"], form])
+                    starts = re.findall(r'\[\\?"(\d{1,2}:\d{2} [AP]M)\\?",(\d+)\]', text)
+                    warn = re.sub(r"<[^>]+>", " ", text.split('class="warning"', 1)[-1])[:160] if not starts else ""
+                    events.append(f"[Direct: wide window {d:%a %b %d}] starts: {[x[0] for x in starts]} "
+                                  f"{' '.join(warn.split())}")
                 # Do two sign-ins run side by side? Sign in again in a separate browser context (not
                 # recorded), send 3 lists from each session at the same moment, and check that the
                 # first session is still signed in afterwards.
