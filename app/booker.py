@@ -707,6 +707,31 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                                      [direct["url"], _render(direct["form"], dctx)])
                 events.append(f"[Direct: 6 lists at once    ] answers after (ms): {sorted(took)}")
                 outcome += f"; 6 lists at once answered after {sorted(took)} ms"
+                # Do two sign-ins run side by side? Sign in again in a separate browser context (not
+                # recorded), send 3 lists from each session at the same moment, and check that the
+                # first session is still signed in afterwards.
+                page2 = browser.new_context().new_page()
+                ok2, msg2 = _login(page2, recipe, base, password)
+                if ok2:
+                    start3 = """([u, f, m]) => { window.__par = null; const t0 = performance.now();
+                        Promise.all([0, 1, 2].map(() => fetch(u, {method: 'POST', body: f, credentials: 'include',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                      'X-Requested-With': 'XMLHttpRequest'}})
+                          .then(r => r.text()).then(t => [Math.round(performance.now() - t0), t.includes(m)])))
+                        .then(r => { window.__par = r; }); }"""
+                    args = [direct["url"], _render(direct["form"], dctx), direct.get("answer_marker", "")]
+                    page.evaluate(start3, args)
+                    page2.evaluate(start3, args)
+                    res = {}
+                    while len(res) < 2 and time.time() - current["t0"] < 15:
+                        for name, pg in (("first", page), ("second", page2)):
+                            got = pg.evaluate("() => window.__par")
+                            if got and name not in res:
+                                res[name] = got
+                        page.wait_for_timeout(20)
+                    outcome += f"; second sign-in OK, 3 lists from each session at once: {res}"
+                else:
+                    outcome += f"; second sign-in failed ({msg2})"
                 outcome += f" list answer '{state}'"
                 if state == "ready":
                     for step in direct.get("grab", []) + steps[then:]:
