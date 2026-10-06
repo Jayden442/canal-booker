@@ -200,6 +200,8 @@ _DIRECT_FIRE = """([u, f, marker, secs]) => {
         const cells = row.rowData || [];
         if (Array.isArray(cells[0]) && Number(cells[0][1]) === secs && String(cells[1]).includes('Book')) {
           const box = document.createElement('div'); box.id = 'cb-direct'; box.innerHTML = cells[1];
+          // On top of everything, so the click lands at once (the portal's own layout can cover the end of the page).
+          box.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647;background:#fff;padding:4px';
           if (box.querySelector('input')) { document.body.appendChild(box); return 'ready'; }
         }
       }
