@@ -696,6 +696,17 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                     page.wait_for_timeout(20)
                     state = _direct_state(page)[0]
                 events.append(f"[Direct: ask for the list   ] +{time.time() - current['t0']:5.2f}s  answer: {state}")
+                # Does the portal answer one session's requests one at a time? Send 6 at once and
+                # time each answer (read only).
+                current.update(step="Direct: 6 lists at once", t0=time.time())
+                took = page.evaluate("""([u, f]) => { const t0 = performance.now();
+                    return Promise.all([0, 1, 2, 3, 4, 5].map(() => fetch(u, {method: 'POST', body: f,
+                        credentials: 'include', headers: {'Content-Type':
+                        'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
+                      .then(r => r.text()).then(() => Math.round(performance.now() - t0)))); }""",
+                                     [direct["url"], _render(direct["form"], dctx)])
+                events.append(f"[Direct: 6 lists at once    ] answers after (ms): {sorted(took)}")
+                outcome += f"; 6 lists at once answered after {sorted(took)} ms"
                 outcome += f" list answer '{state}'"
                 if state == "ready":
                     for step in direct.get("grab", []) + steps[then:]:
