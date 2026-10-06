@@ -403,9 +403,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                 try:
                     run_steps(page, prepare, ctx, settle=True)
                     tabs.append({"page": page, "ctx": ctx, "label": label, "room": room,
-                                 "time": f"{start_text}-{end_text}", "alive": True,
-                                 "direct": bool(direct_grab) and all(
-                                     k in ctx for k in (direct.get("capture") or {}).get("fields", {}))})
+                                 "time": f"{start_text}-{end_text}", "alive": True})
                     break
                 except StepFailed as e:
                     # Start the tab over from the first page, unless the open time is under
@@ -415,7 +413,6 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                     notes.append(f"{label} could not get ready at '{_step_label(e)}' "
                                  f"({_scrub(e.detail, password)})")
                     _shot(page, f"{day}_race_prepare_{room}_{start_text}")
-            page.remove_listener("request", listener)
         if not tabs:
             result.update(status="error", message="Midnight mode: no choice got ready. " + "; ".join(notes),
                           screenshot=_shot(first, f"{day}_race_prepare_failed"))
@@ -441,10 +438,18 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         # First reload now (3 s early). The reload right at the open time is spread across the tabs
         # (0.1 s early, on time, 0.1 s late, and so on) so a small clock error doesn't cost a full
         # extra reload: whichever tab lands first just after the opening sees the day.
+        # A tab skips the calendar once its calendar request has given the room's ids. Playwright
+        # passes on request events only while it is busy, so give them up to a second to arrive.
+        fields = list((direct.get("capture") or {}).get("fields", {}))
+        captured = lambda t: bool(direct_grab) and bool(fields) and all(k in t["ctx"] for k in fields)
+        wait_until = time.time() + 1
+        while direct_grab and not all(captured(t) for t in tabs) and time.time() < wait_until:
+            first.wait_for_timeout(50)
         switched = []  # tabs whose direct answer looked wrong and went back to the calendar
         for t in tabs:
             t["next"] = time.time()
             t["state"] = "none"
+            t["direct"] = captured(t)
         sync = f"Portal clock {offset:+.2f} s from ours; calendar reload {reload_s:.2f} s."
 
         def is_ready(t):
