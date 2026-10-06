@@ -38,7 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      # Everyone's copy (fork) runs the newest code from the main repo, so fixes reach the whole
+      # group without anyone clicking "Sync fork". Each copy still uses its own password secret.
+      # The main repo itself checks out whatever branch was run, so a branch can be tested.
       - uses: actions/checkout@v4
+        with:
+          repository: silix54/canal-booker
+          ref: ${{ github.repository == 'silix54/canal-booker' && github.ref || 'main' }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

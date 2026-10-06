@@ -17,6 +17,8 @@ Uses free GitHub Actions. You need a GitHub account.
 3. Open the **Actions** tab and click **I understand my workflows, go ahead and enable them**.
 4. Test it: **Actions → Book my room → Run workflow**, leave mode on `test`, click **Run workflow**. After a couple of minutes, open the run. It should say "Midnight mode dry run: … Nothing was booked."
 
+**Updates are automatic.** Your copy runs the newest code from this repo every night, so you never need to click "Sync fork". (Copies made before Oct 6, 2026 need one last **Sync fork → Update branch** to switch this on.) Your password stays in your own copy's secrets.
+
 That's it. Every night it starts in the evening (GitHub can start scheduled jobs hours late, so it starts early and waits), gets ready a couple of minutes before midnight, and books the moment the day opens.
 
 **Checking that it worked:** open **Actions**, click last night's **Book my room** run, and read the box at the top: **✅ Booked Wed Oct 7** with the room and time, **❌ Not booked**, **❌ Sign-in failed** or **❌ Not set up**. Anything with ❌ counts as a failed run, and GitHub emails you about it. To get an email for successful bookings too, go to your GitHub **Settings → Notifications → Actions** and untick "Only notify for failed workflows". The portal's **My Bookings** page always shows what you actually have.

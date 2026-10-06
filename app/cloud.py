@@ -165,15 +165,18 @@ def test(s, password, recipe):
             summary("✅ Test passed", result["message"], s, "Test passed",
                     date=day.isoformat(), room=result.get("room"), time=result.get("time"))
             return 0
-        if result["status"] != "unavailable" or tried >= 3:
-            hint = (" The portal shows a day as unavailable when every choice is taken, or when you already"
-                    " have 3 hours booked that day. Try other days or rooms (dates and rooms boxes)."
-                    if result["status"] == "unavailable" else "")
-            summary("❌ Test failed", result["message"] + hint, s, "Test failed", date=day.isoformat())
+        if result["status"] != "unavailable":
+            # A real problem (sign-in, a step that broke): fail, so GitHub emails about it.
+            summary("❌ Test failed", result["message"], s, "Test failed", date=day.isoformat())
             return 1
-    summary("✅ Test passed (sign-in and form steps work)",
-            "Every choice was full, or you already have bookings, on the days tried, so it could not reach the last step.",
-            s, "Test passed")
+        if tried >= 3:
+            break
+    # No open day to try (all taken, already booked, or closed): sign-in and the form steps worked,
+    # so this is not a failure and should not send a failure email.
+    summary("⚪ Nothing to test",
+            "Sign-in and the form steps worked, but no day could be tried to the last step: every choice was"
+            " taken, or you already have 3 hours booked, or the day is closed. Pick other days or rooms in the"
+            " dates and rooms boxes to test further.", s, "Test: nothing open")
     return 0
 
 

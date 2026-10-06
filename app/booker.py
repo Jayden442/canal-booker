@@ -308,8 +308,37 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                 first.wait_for_timeout(left * 1000)
         if notes:
             result["message"] += " " + "; ".join(notes) + "."
+        result["message"] += " " + _calendar_seen(tabs, day)
         browser.close()
     return result
+
+
+def _calendar_seen(tabs, day):
+    """What the first choice's calendar shows, to tell "this day is full or closed" apart from
+    "the bot can't see any open day" (the page changed)."""
+    for t in tabs:
+        try:
+            page = t["page"]
+            shown = page.eval_on_selector_all("[id^='day']", "els => els.map(e => e.id)")
+            open_ids = page.eval_on_selector_all("td.dayAvailable [id^='day']", "els => els.map(e => e.id)")
+        except Exception:
+            continue
+        def dates(ids):
+            out = []
+            for i in ids:
+                try:
+                    out.append(dt.datetime.fromtimestamp(int(i[3:]), dt.timezone.utc).date())
+                except ValueError:
+                    pass
+            return sorted(set(out))
+        shown, open_days = dates(shown), dates(open_ids)
+        if not shown:
+            return f"Calendar check ({t['room']}): no calendar days found on the page."
+        listed = ", ".join(f"{d:%a %b %d}" for d in open_days[:10]) or "none"
+        where = "is in the calendar" if day in shown else "is not in the calendar shown"
+        return (f"Calendar check ({t['room']} {t['time']}): {len(shown)} days shown, {day:%b %d} {where}; "
+                f"days open for this room and time: {listed}.")
+    return "Calendar check: no page to read."
 
 
 def run_bookings(settings, password, recipe, targets, dry_run=False):

@@ -44,6 +44,8 @@ var PLAN_ROWS = 200;
  * Safe to run again.
  */
 function setupDropdowns() {
+  // Show times in Ottawa time. New sheets default to Pacific time, which made the Status tab 3 hours off.
+  SpreadsheetApp.getActive().setSpreadsheetTimeZone('America/Toronto');
   var found = findPlan_();
   if (!found) {
     SpreadsheetApp.getActive().toast('No plan tab found (a row with Username and Day).');
@@ -153,6 +155,7 @@ function makeGuide_(ss) {
     ['5. Test: Actions > Book my room > Run workflow > mode "test" > Run workflow. After a couple of minutes the Status tab here shows "Test passed" for you. Nothing is booked by a test.'],
     ['6. Done. It runs every night by itself. To get emails for good news too: GitHub Settings > Notifications > Actions > untick "Only notify for failed workflows".'],
     ['Your password is stored as an encrypted GitHub secret. It is never shown in logs and never sent to this sheet.'],
+    ['Updates are automatic: your copy runs the newest code from ' + REPO + ' every night. Copies made before Oct 6, 2026 need one last click: open your copy on GitHub > Sync fork > Update branch.'],
     [''],
     ['# Step 2, option B: run it on your computer'],
     ['1. Open ' + REPO + '/releases and download CanalBooker.exe (Windows) or CanalBooker-Mac.zip (Mac).'],
