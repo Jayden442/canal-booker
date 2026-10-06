@@ -11,6 +11,7 @@ Settings come from environment variables (GitHub secrets and variables):
   TEAM_PLAN_URL      the team plan sheet link             (variable, optional; default in app_defaults.json)
   ROOMS              rooms in order, like "CB 2103, CB 2302" (variable, optional; overrides the plan)
   MODE               "book" (default), "test" (dry run on the next open day right now),
+                     "trace" (a dry run that records the portal's requests, for working on the bot),
                      "now" (really book every open day in the plan right now)
   DATES              with "now" or "test": only these days, like "2026-10-02, 2026-10-06" (optional)
 
@@ -217,6 +218,27 @@ def book_now(s, password, recipe):
     return 0 if booked else 1
 
 
+def trace(s, password, recipe):
+    """Record the portal's traffic for one dry-run booking (see booker.trace_booking). Uses the
+    first day in the dates box, or else the next day that has a row in the plan."""
+    only = sorted(d.strip() for d in os.environ.get("DATES", "").split(",") if d.strip())
+    today = dt.datetime.now(TZ).date()
+    days = [dt.date.fromisoformat(d) for d in only] or [today + dt.timedelta(days=o) for o in range(int(s["days_ahead"]), 0, -1)]
+    for day in days:
+        slot = slot_for(s, day) or (s["slots"] and dict(s["slots"][0], times=storage.slot_times(s["slots"][0])))
+        if slot:
+            break
+    else:
+        summary("Nothing to trace", "No row in the team plan to trace with.")
+        return 0
+    log(f"Tracing the portal's traffic on {day:%a %b %d}. Sign-in is not recorded; names are replaced.")
+    events, outcome = booker.trace_booking(s, password, recipe, day, slot)
+    for line in events:
+        print(line, flush=True)
+    summary("🔎 Trace done", f"{outcome} {len(events)} requests and responses recorded; they are in the run log.")
+    return 0
+
+
 def main():
     try:
         sys.stdout.reconfigure(errors="replace")  # a console without emoji support won't crash
@@ -234,6 +256,8 @@ def main():
         return test(s, password, recipe)
     if mode == "now":
         return book_now(s, password, recipe)
+    if mode == "trace":
+        return trace(s, password, recipe)
     return book(s, password, recipe)
 
 

@@ -446,6 +446,71 @@ def _calendar_seen(tabs, day):
     return "Calendar check: no page to read."
 
 
+def trace_booking(settings, password, recipe, day, slot):
+    """Dry run of one choice that records the portal's traffic after sign-in: every request
+    (method, address, form fields) and response (status, type, size, start of the body), with
+    the time since the step began. Used to find out which requests the calendar and the
+    start-time list really make. Sign-in is not recorded, and headers and cookies never are;
+    the username and name are replaced. Returns (events, outcome text)."""
+    from playwright.sync_api import sync_playwright
+    steps = recipe.get("book", [])
+    times = slot.get("times") or storage.slot_times(slot)
+    room = (slot.get("rooms") or settings["rooms"])[0]
+    start_text, end_text = times[0]
+    base = _base_ctx(settings, password)
+    secrets = [x for x in (password, settings.get("username"), settings.get("_name")) if x]
+
+    def clean(text, limit):
+        text = " ".join(str(text or "").split())[:limit]
+        for s in secrets:
+            text = text.replace(s, "<user>" if s != settings.get("_name") else "<name>")
+        return text
+
+    events, current = [], {"step": "", "t0": time.time()}
+
+    def on_request(req):
+        if req.resource_type in ("image", "font", "stylesheet", "media"):
+            return
+        events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  -> {req.method} "
+                      f"{clean(req.url, 160)}" + (f"  form: {clean(req.post_data, 300)}" if req.post_data else ""))
+
+    def on_response(resp):
+        req = resp.request
+        if req.resource_type in ("image", "font", "stylesheet", "media"):
+            return
+        try:
+            body = resp.text() if req.resource_type in ("xhr", "fetch", "document") else ""
+        except Exception:
+            body = ""
+        events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  <- {resp.status} "
+                      f"{req.resource_type} {len(body)} chars  {clean(req.url, 100)}"
+                      + (f"  body: {clean(body, 200)}" if body else ""))
+
+    with sync_playwright() as p:
+        browser = _launch(p, settings.get("show_browser"))
+        page = browser.new_page()
+        ok, msg = _login(page, recipe, base, password)
+        if not ok:
+            browser.close()
+            return events, msg
+        page.on("request", on_request)
+        page.on("response", on_response)
+        ctx = _ctx(base, recipe, day, room, start_text, end_text)
+        outcome = "done"
+        for step in steps:
+            current.update(step=step.get("note") or step.get("action"), t0=time.time())
+            try:
+                if run_steps(page, [step], ctx, dry_run=True) == "dry_run":
+                    outcome = "stopped before the final OK (nothing booked)"
+                    break
+            except StepFailed as e:
+                outcome = f"stopped at '{_step_label(e)}' ({_scrub(e.detail, password)})"
+                break
+        page.wait_for_timeout(500)
+        browser.close()
+    return events, f"Traced {room} {start_text}-{end_text} on {day:%a %b %d}: {outcome}."
+
+
 def run_bookings(settings, password, recipe, targets, dry_run=False):
     """targets: list of (date, slot). Returns one result per target."""
     from playwright.sync_api import sync_playwright
