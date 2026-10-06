@@ -84,6 +84,7 @@ def slot_for(s, day):
 
 
 def book(s, password, recipe):
+    log(s)
     now = dt.datetime.now(TZ)
     open_at = dt.datetime.combine(now.date(), _hm(s.get("open_time", "00:00")), TZ)
     if open_at <= now:
