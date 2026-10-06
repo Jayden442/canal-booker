@@ -56,14 +56,20 @@ def _scrub(text, secret):
     return text.replace(secret, "********") if secret else text
 
 
+# Tabs that are not in front are slowed down by the browser (timers and animation frames), which
+# made every click in them take a second or two. Midnight mode keeps up to 6 tabs open, so turn that off.
+BROWSER_ARGS = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows"]
+
+
 def _launch(p, show):
     """Use Edge or Chrome already on the computer, so nothing extra has to be downloaded."""
     last = None
     for channel in ("msedge", "chrome", None):
         try:
             if channel:
-                return p.chromium.launch(channel=channel, headless=not show)
-            return p.chromium.launch(headless=not show)
+                return p.chromium.launch(channel=channel, headless=not show, args=BROWSER_ARGS)
+            return p.chromium.launch(headless=not show, args=BROWSER_ARGS)
         except Exception as e:
             last = e
     raise RuntimeError("No browser found. Please install Google Chrome or Microsoft Edge.") from last
@@ -77,7 +83,7 @@ def _settle(page):
         pass
 
 
-def run_steps(page, steps, ctx, dry_run=False, settle=False):
+def run_steps(page, steps, ctx, dry_run=False, settle=False, timings=None):
     """settle=True waits for the page to go quiet after each click or dropdown change. Slower,
     so it is used for the early preparation, not for the steps raced at the open time."""
     for i, step in enumerate(steps):
@@ -85,6 +91,7 @@ def run_steps(page, steps, ctx, dry_run=False, settle=False):
             return "dry_run"
         action = step.get("action")
         timeout = step.get("timeout", 10000)
+        started = time.time()
         try:
             if action == "goto":
                 page.goto(_render(step["url"], ctx), wait_until="domcontentloaded", timeout=30000)
@@ -112,11 +119,68 @@ def run_steps(page, steps, ctx, dry_run=False, settle=False):
                     raise ValueError(f"Unknown step action '{action}'")
                 if settle and action in ("click", "select", "press", "check"):
                     _settle(page)
+            if timings is not None:
+                timings.append((step.get("note") or action, time.time() - started))
         except Exception as e:
+            if timings is not None:
+                timings.append(((step.get("note") or action) + " (failed)", time.time() - started))
             if step.get("optional"):
                 continue
             raise StepFailed(step.get("on_fail", "error"), i, step, e)
     return "done"
+
+
+def _timing_text(timings):
+    """'Pick the date 0.31 s, Wait for the list ... 0.52 s' with notes cut short."""
+    return ", ".join(f"{n.split(' (')[0][:32]} {s:.2f} s" for n, s in timings)
+
+
+_MARK = "() => document.querySelectorAll(\"[id^='day']\").forEach(e => e.setAttribute('data-cb-old', '1'))"
+# Still reloading while the marked old days are on the page, or while no days are shown yet (the
+# portal clears the calendar the moment Verify Calendar is clicked and fills it when the answer arrives).
+_RELOADING = "() => !!document.querySelector('[data-cb-old]') || !document.querySelector(\"[id^='day']\")"
+
+
+def _reloading(page):
+    """True while a reload started by _fire is still on its way: the marked calendar days are still
+    on the page, no new days are shown yet, or the page is between documents."""
+    try:
+        return page.evaluate(_RELOADING)
+    except Exception:
+        return True
+
+
+def _fire(page, steps, ctx):
+    """Start the race "refresh" steps (Verify Calendar) without waiting for the page to reload, so
+    every tab reloads at the same time. Clicks go through the page's own JavaScript; anything that
+    is not a simple click falls back to the normal step runner. The calendar's day cells are marked
+    first: the reload is done when the marked cells are gone (replaced or a new page)."""
+    try:
+        page.evaluate(_MARK)
+    except Exception:
+        pass
+    for step in steps:
+        if step.get("action") == "click":
+            try:
+                page.evaluate("sel => { const e = document.querySelector(sel); if (e) e.click(); }",
+                              _render(step["selector"], ctx))
+                continue
+            except Exception as e:
+                if "context was destroyed" in str(e) or "navigat" in str(e).lower():
+                    continue  # the click already started a page load
+        try:
+            run_steps(page, [step], ctx)
+        except StepFailed:
+            pass
+
+
+def _measure_reload(page, steps, ctx, limit=5.0):
+    """Seconds one calendar reload takes on the portal (fire, then wait until it is replaced)."""
+    started = time.time()
+    _fire(page, steps, ctx)
+    while _reloading(page) and time.time() - started < limit:
+        page.wait_for_timeout(20)
+    return time.time() - started
 
 
 def _step_label(err: StepFailed):
@@ -182,13 +246,25 @@ def _ctx(base, recipe, day, room, start_text, end_text):
 
 
 def _clock_offset(page, url):
-    """Seconds the portal's clock is ahead of ours, from its Date header (about 1 second precise)."""
-    try:
+    """Seconds the portal's clock is ahead of ours.
+
+    The Date header only has whole seconds, so one reading is up to half a second off. Instead,
+    ask about every 0.1 s until the portal's second ticks over: the tick happened between the two
+    readings, which pins the offset down to roughly 0.1 s plus half the round trip."""
+    def read():
         before = time.time()
         resp = page.request.head(url, timeout=10000)
         after = time.time()
-        server = email.utils.parsedate_to_datetime(resp.headers["date"]).timestamp()
-        return server + 0.5 - (before + after) / 2
+        return (before + after) / 2, email.utils.parsedate_to_datetime(resp.headers["date"]).timestamp()
+    try:
+        prev_mid, prev_s = read()
+        for _ in range(25):
+            time.sleep(0.1)
+            mid, s = read()
+            if s > prev_s:  # the second ticked between the previous reading and this one
+                return s - (prev_mid + mid) / 2
+            prev_mid, prev_s = mid, s
+        return prev_s + 0.5 - prev_mid  # no tick seen: fall back to the middle of the second
     except Exception:
         return 0.0
 
@@ -276,50 +352,75 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             return "(the day was already open)" if already_open else f"{max(after, 0):.1f} s after opening"
 
         deadline = max(open_local, time.time()) + window
+        refresh = race.get("refresh", [])
+        ready_sel = race["ready"]
+        # How long one calendar reload takes on the portal (the last preparation step, measured above).
+        # Near the open time each waiting tab reloads again as soon as the last reload could be back.
+        reload_s = _measure_reload(tabs[0]["page"], refresh, tabs[0]["ctx"])
+        rapid = max(0.3, reload_s)
+        next_fire = time.time()  # first reload now (3 s early), the next one right at the open time
+        sync = f"Portal clock {offset:+.2f} s from ours; calendar reload {reload_s:.2f} s."
+
+        def is_ready(t):
+            try:
+                return t["page"].locator(_render(ready_sel, t["ctx"])).count() > 0
+            except Exception:  # the page is mid-reload
+                return False
+
         while time.time() < deadline and any(t["alive"] for t in tabs):
-            round_start = time.time()
-            for t in tabs:
-                if t["alive"]:
-                    try:
-                        run_steps(t["page"], race.get("refresh", []), t["ctx"])
-                    except StepFailed:
-                        pass
-            first.wait_for_timeout(min(700, poll * 1000))
-            for t in tabs:  # in order of preference
-                if not t["alive"]:
-                    continue
-                if t["page"].locator(_render(race["ready"], t["ctx"])).count() == 0:
-                    continue
-                print(f"[booking] attempting ready midnight choice {t['choice_index']}: {t['label']}", flush=True)
-                try:
-                    outcome = run_steps(t["page"], grab, t["ctx"], dry_run=dry_run)
-                    when = _when()
-                    shot = _shot(t["page"], f"{day}_race_{t['room']}_{outcome}")
-                    # Say what happened to the choices tried before this one (taken by someone else, and when).
-                    before = f" Before that: {'; '.join(notes)}." if notes else ""
-                    if outcome == "dry_run":
-                        result.update(room=t["room"], time=t["time"], status="dry_run", screenshot=shot,
-                                      message=f"Midnight mode dry run: {t['label']} was free {when}. Nothing was booked.{before}")
-                    else:
-                        result.update(room=t["room"], time=t["time"], status="booked", screenshot=shot,
-                                      message=f"Midnight mode booked {t['label']} {when}.{before}")
-                    print(f"[booking] midnight choice {t['choice_index']} {outcome}: {t['label']}", flush=True)
-                    browser.close()
-                    return result
-                except StepFailed as e:
-                    t["alive"] = False
-                    print(f"[booking] midnight choice {t['choice_index']} failed ({e.outcome}): "
-                          f"{t['label']} at {_step_label(e)}", flush=True)
-                    notes.append(f"{t['label']} " + (f"was taken by someone else (seen {_when()})"
-                                                     if e.outcome == "unavailable"
-                                                     else f"failed at '{_step_label(e)}' {_when()}"))
-                    result["screenshot"] = _shot(t["page"], f"{day}_race_{t['room']}_{e.outcome}")
-            left = poll - (time.time() - round_start)
-            if left > 0:
-                first.wait_for_timeout(left * 1000)
+            now = time.time()
+            if now >= next_fire:
+                # Reload every waiting tab's calendar at the same time instead of one after another.
+                for t in tabs:
+                    # Never click again while this tab's last reload is still loading (that would
+                    # cancel it), unless it has been stuck for 2.5 s.
+                    if t["alive"] and not is_ready(t) and (
+                            not _reloading(t["page"]) or now - t.get("fired", 0) > 2.5):
+                        _fire(t["page"], refresh, t["ctx"])
+                        t["fired"] = now
+                if now < open_local:
+                    next_fire = open_local + 0.05
+                elif now < open_local + 8:
+                    next_fire = now + rapid  # the first seconds after opening: reload again quickly
+                else:
+                    next_fire = now + poll
+            ready = [t for t in tabs if t["alive"] and is_ready(t)]
+            if not ready:
+                first.wait_for_timeout(100)
+                continue
+            if ready[0] is not next(t for t in tabs if t["alive"]):
+                # A lower choice opened first; give better choices still reloading a moment to catch up.
+                first.wait_for_timeout(250)
+                ready = [t for t in tabs if t["alive"] and is_ready(t)] or ready
+            t = ready[0]  # the best choice that is open right now
+            try:
+                t["page"].bring_to_front()  # a tab in front is not slowed down by the browser
+                steps_timed = []
+                outcome = run_steps(t["page"], grab, t["ctx"], dry_run=dry_run, timings=steps_timed)
+                when = _when()
+                shot = _shot(t["page"], f"{day}_race_{t['room']}_{outcome}")
+                # Say what happened to the choices tried before this one (taken by someone else, and when).
+                before = f" Before that: {'; '.join(notes)}." if notes else ""
+                timing = f" {sync} Step times: {_timing_text(steps_timed)}."
+                if outcome == "dry_run":
+                    result.update(room=t["room"], time=t["time"], status="dry_run", screenshot=shot,
+                                  message=f"Midnight mode dry run: {t['label']} was free {when}. Nothing was booked.{before}{timing}")
+                else:
+                    result.update(room=t["room"], time=t["time"], status="booked", screenshot=shot,
+                                  message=f"Midnight mode booked {t['label']} {when}.{before}{timing}")
+                browser.close()
+                return result
+            except StepFailed as e:
+                # No screenshot here: it costs about a second, and the next choice is waiting.
+                t["alive"] = False
+                t["failed"] = e.outcome
+                notes.append(f"{t['label']} " + (f"was taken by someone else (seen {_when()})"
+                                                 if e.outcome == "unavailable"
+                                                 else f"failed at '{_step_label(e)}' {_when()}"))
         if notes:
             result["message"] += " " + "; ".join(notes) + "."
-        result["message"] += " " + _calendar_seen(tabs, day)
+        result["message"] += " " + _calendar_seen(tabs, day) + " " + sync
+        result["screenshot"] = _shot(tabs[0]["page"], f"{day}_race_nothing_booked")
         browser.close()
     return result
 

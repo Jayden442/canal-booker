@@ -155,8 +155,14 @@ def test(s, password, recipe):
     only = {d.strip() for d in os.environ.get("DATES", "").split(",") if d.strip()}
     for offset in range(int(s["days_ahead"]), 0, -1):
         day = dt.datetime.now(TZ).date() + dt.timedelta(days=offset)
+        if only and day.isoformat() not in only:
+            continue
         slot = slot_for(s, day)
-        if not slot or (only and day.isoformat() not in only):
+        if not slot and only and s["slots"]:
+            # A day picked in the dates box with no row of its own (say a weekend): borrow the first
+            # row's times and rooms, so a test can run on whatever day happens to be open.
+            slot = dict(s["slots"][0], day=storage.DAYS[day.weekday()], times=storage.slot_times(s["slots"][0]))
+        if not slot:
             continue
         tried += 1
         log(f"Test (dry run) on {day:%a %b %d}. Rooms: {', '.join(slot.get('rooms') or s['rooms'])}.")
