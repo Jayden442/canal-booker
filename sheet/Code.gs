@@ -4,7 +4,7 @@
  * Install once (the sheet owner):
  *   1. In the team plan sheet: Extensions > Apps Script. Delete what is there, paste this file, Save.
  *   2. Pick "setup" in the function list at the top and click Run. Allow access when Google asks.
- *      This adds the "Room bookings" page (first tab), the "Setup guide" and "Status" tabs.
+ *      This adds the "Room bookings" page (first tab), the "Setup guide", "Status" and "Analytics" tabs.
  *   3. Deploy > New deployment > type "Web app". Execute as: Me. Who has access: Anyone. Deploy.
  *      Copy the Web app URL (ends in /exec) and put it in app_defaults.json as "status_url".
  *
@@ -23,6 +23,7 @@ var REPO = 'https://github.com/silix54/canal-booker';
 var STATUS = 'Status';
 var GUIDE = 'Setup guide';
 var BOOKINGS = 'Room bookings';
+var ANALYTICS = 'Analytics';
 var TZ = 'America/Toronto';
 var HEADERS = ['When (Ottawa)', 'Name', 'Username', 'For date', 'Room', 'Time', 'Result', 'Details', 'Ran from'];
 
@@ -30,20 +31,26 @@ function setup() {
   var ss = SpreadsheetApp.getActive();
   makeGuide_(ss);
   makeStatus_(ss);
+  makeAnalytics_(ss);
   setupDropdowns();
   refreshBookings();
+  refreshAnalytics();
   protect_(ss.getSheetByName(STATUS));
+  protect_(ss.getSheetByName(ANALYTICS));
   // Rebuild the bookings page once a night too, so "this week" moves on even without new results.
   var has = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'refreshBookings'; });
   if (!has) ScriptApp.newTrigger('refreshBookings').timeBased().everyDays(1).atHour(0).nearMinute(30).inTimezone(TZ).create();
+  var hasAnalytics = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'refreshAnalytics'; });
+  if (!hasAnalytics) ScriptApp.newTrigger('refreshAnalytics').timeBased().everyDays(1).atHour(0).nearMinute(35).inTimezone(TZ).create();
   ss.setActiveSheet(ss.getSheetByName(BOOKINGS));
-  ss.toast('Room bookings page, Setup guide, Status tab and dropdowns are ready.');
+  ss.toast('Room bookings page, Setup guide, Status tab, Analytics tab and dropdowns are ready.');
 }
 
 /** Adds a Canal Booker menu to the sheet, so the organizer can redo things without opening the script. */
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Canal Booker')
     .addItem('Refresh the bookings page', 'refreshBookings')
+    .addItem('Refresh the analytics tab', 'refreshAnalytics')
     .addItem('Set up dropdowns', 'setupDropdowns')
     .addToUi();
 }
@@ -197,6 +204,7 @@ function makeGuide_(ss) {
     ['# Checking if you got your room'],
     ['The Room bookings tab (the first one) shows this week\'s and next week\'s bookings and every booking coming up, for everyone. It updates by itself after each booking.'],
     ['The Status tab has every result, newest at the top: Booked (green), Not booked or Sign-in failed (red), Test passed. The portal\'s My Bookings page always shows what you really have.'],
+    ['The Analytics tab counts successful bookings by primary or backup time and room preference over the past 1, 3 and 7 days, based on when each result was recorded. These rolling windows overlap.'],
     ['Not booked? The room may already be taken. Book by hand on booking.carleton.ca, the rest of the week stays open.'],
     ['Please cancel any booking you will not use. Unused rooms block other students, and the portal shows who booked them.'],
   ];
@@ -230,6 +238,163 @@ function makeStatus_(ss) {
   ]);
 }
 
+function makeAnalytics_(ss) {
+  var sh = ss.getSheetByName(ANALYTICS) || ss.insertSheet(ANALYTICS, ss.getNumSheets());
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+  sh.clear();
+  sh.getRange(1, 1, 1, 4).merge().setValue('Booked preference statistics').setFontWeight('bold').setFontSize(14);
+  sh.getRange(2, 1, 1, 4).merge().setValue('Successful bookings, grouped by when the result was recorded in Status. Windows are rolling and overlap.');
+  sh.getRange(3, 1, 1, 4).setValues([['Metric', 'Past 1 day', 'Past 3 days', 'Past 7 days']])
+    .setFontWeight('bold').setBackground('#f3f3f3');
+  sh.getRange(4, 1, 7, 4).setValues([
+    ['Primary time slot', 0, 0, 0],
+    ['Backup 1', 0, 0, 0],
+    ['Backup 2', 0, 0, 0],
+    ['Room 1', 0, 0, 0],
+    ['Room 2', 0, 0, 0],
+    ['Room 3', 0, 0, 0],
+    ['Rows matched to plan', 0, 0, 0],
+  ]);
+  sh.getRange(13, 1, 1, 4).merge().setValue('Bot runtime statistics').setFontWeight('bold').setFontSize(14);
+  sh.getRange(14, 1, 2, 4).setValues([
+    ['Average time', 0.0, 0.0, 0.0], 
+    ['Worst time', 0.0, 0.0, 0.0]
+  ]);
+  sh.setFrozenRows(3);
+  sh.setColumnWidth(1, 220);
+  sh.setColumnWidths(2, 3, 110);
+  sh.setHiddenGridlines(true);
+  sh.setTabColor('#b4122e');
+}
+
+function normalizeTimeRange_(text) {
+  var t = String(text || '').trim();
+  if (!t) return '';
+  t = t.replace(/\s+/g, '').replace(/\s*[-–]\s*/g, '-');
+  var m = t.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+  if (!m) return t;
+  return ('0' + m[1]).slice(-2) + ':' + m[2] + '-' + ('0' + m[3]).slice(-2) + ':' + m[4];
+}
+
+function sameTimeRange_(a, b) {
+  return normalizeTimeRange_(a) && normalizeTimeRange_(a) === normalizeTimeRange_(b);
+}
+
+function sameRoom_(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
+
+function parseDateKey_(value) {
+  var s = String(value || '').trim();
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return '';
+  var d = new Date(m[1] + '-' + m[2] + '-' + m[3] + 'T12:00:00');
+  return d && !isNaN(d) ? Utilities.formatDate(d, TZ, 'EEE').slice(0, 3).toLowerCase() : '';
+}
+
+function planLookupForAnalytics_() {
+  var found = findPlan_();
+  if (!found) return {};
+  var sh = found.sheet;
+  var values = sh.getDataRange().getValues();
+  var out = {};
+  for (var r = found.row; r < values.length; r++) {
+    var row = values[r];
+    if (!String(row.join('')).trim()) continue;
+    var username = String(row[1] || '').trim().split('@')[0].toLowerCase();
+    var day = String(row[2] || '').trim().substring(0, 3).toLowerCase();
+    if (!username || !day) continue;
+    var start = normalizeTimeRange_(String(row[3] || '').trim() + '-' + String(row[4] || '').trim());
+    var backup1 = normalizeTimeRange_(String(row[5] || '').trim());
+    var backup2 = normalizeTimeRange_(String(row[6] || '').trim());
+    var room1 = String(row[7] || '').trim();
+    var room2 = String(row[8] || '').trim();
+    var room3 = String(row[9] || '').trim();
+    out[username + '|' + day] = { main: start, backup1: backup1, backup2: backup2, room1: room1, room2: room2, room3: room3 };
+  }
+  return out;
+}
+
+function refreshAnalytics() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(ANALYTICS) || ss.insertSheet(ANALYTICS, ss.getNumSheets());
+  var windows = [1, 3, 7];
+  var counts = windows.map(function () {
+    return { primary: 0, backup1: 0, backup2: 0, room1: 0, room2: 0, room3: 0, matched: 0, avg_time: 0.0, worst_time: 0.0, total_seconds: 0.0, midnight_booked_entries: 0};
+  });
+
+  var now = new Date().getTime();
+  var cutoffs = windows.map(function (days) { return now - days * 24 * 60 * 60 * 1000; });
+
+  var s = ss.getSheetByName(STATUS);
+  if (s && s.getLastRow() > 1) {
+    var rows = s.getRange(2, 1, s.getLastRow() - 1, HEADERS.length).getValues();
+    var plan = planLookupForAnalytics_();
+    var total_seconds = 0.0
+    var midnight_booked_entries = 0
+    var worst_time = 0.0
+    rows.forEach(function (r) {
+      if (!/^Booked/.test(String(r[6])) || !String(r[7]).includes("Midnight mode booked")) return;
+      if (!(r[0] instanceof Date) || isNaN(r[0].getTime())) return;
+      var recordedAt = r[0].getTime();
+      var included = [];
+      for (var w = 0; w < windows.length; w++) {
+        if (recordedAt >= cutoffs[w] && recordedAt <= now) included.push(w);
+      }
+      if (!included.length) return;
+      var user = String(r[2] || '').trim().split('@')[0].toLowerCase();
+      var day = parseDateKey_(r[3]);
+      if (!user || !day) return;
+
+      var row = plan[user + '|' + day];
+      if (!row) return;
+      var time = normalizeTimeRange_(String(r[5] || '').trim());
+      var room = String(r[4] || '').trim();
+      const match = String(r[7]).match(/(\d+(?:\.\d+)?)\s*s\s+after opening/);
+      included.forEach(function (i) {
+        if (match) {
+          var seconds = Number(match[1]);
+          counts[i].total_seconds += seconds;
+          counts[i].midnight_booked_entries += 1;
+          counts[i].worst_time = Math.max(counts[i].worst_time, seconds);
+        }
+        counts[i].matched += 1;
+        if (sameTimeRange_(time, row.main)) counts[i].primary += 1;
+        else if (sameTimeRange_(time, row.backup1)) counts[i].backup1 += 1;
+        else if (sameTimeRange_(time, row.backup2)) counts[i].backup2 += 1;
+
+        if (sameRoom_(room, row.room1)) counts[i].room1 += 1;
+        else if (sameRoom_(room, row.room2)) counts[i].room2 += 1;
+        else if (sameRoom_(room, row.room3)) counts[i].room3 += 1;
+      });
+    });
+  }
+  counts.forEach(function (c) {
+    if (c.midnight_booked_entries != 0) {
+      c.avg_time = c.total_seconds/c.midnight_booked_entries;
+    }
+    else {
+      counts[i].avg_time = "None";
+    }
+  })
+  sh.getRange(4, 1, 7, 4).setValues([
+    ['Primary time slot', counts[0].primary, counts[1].primary, counts[2].primary],
+    ['Backup 1', counts[0].backup1, counts[1].backup1, counts[2].backup1],
+    ['Backup 2', counts[0].backup2, counts[1].backup2, counts[2].backup2],
+    ['Room 1', counts[0].room1, counts[1].room1, counts[2].room1],
+    ['Room 2', counts[0].room2, counts[1].room2, counts[2].room2],
+    ['Room 3', counts[0].room3, counts[1].room3, counts[2].room3],
+    ['Rows matched to plan', counts[0].matched, counts[1].matched, counts[2].matched],
+  ]);
+  sh.getRange(1, 1, 1, 4).setBackground('#ffffff');
+  sh.getRange(4, 1, 7, 4).setFontWeight('normal');
+  sh.getRange(14, 1, 2, 4).setValues([
+    ['Average time', counts[0].avg_time, counts[1].avg_time, counts[2].avg_time],
+    ['Worst time', counts[0].worst_time, counts[1].worst_time, counts[2].worst_time]
+  ]);
+  sh.getRange(14, 1, 2, 4).setFontWeight('normal');
+}
+
 /** The booker posts results here as JSON. */
 function doPost(e) {
   var d;
@@ -256,6 +421,7 @@ function doPost(e) {
   }
   if (/^Booked/.test(clean_(d.result))) {
     try { refreshBookings(); } catch (err) { /* the page catches up at the nightly refresh */ }
+    try { refreshAnalytics(); } catch (err) { /* the sheet catches up at the nightly refresh */ }
   }
   return reply_('ok');
 }
