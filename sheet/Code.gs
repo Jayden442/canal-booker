@@ -59,8 +59,7 @@ var PLAN_ROWS = 200;
  * Safe to run again.
  */
 function setupDropdowns() {
-  // Show times in Ottawa time. New sheets default to Pacific time, which made the Status tab 3 hours off.
-  SpreadsheetApp.getActive().setSpreadsheetTimeZone('America/Toronto');
+  fixTimeZone_();
   var found = findPlan_();
   if (!found) {
     SpreadsheetApp.getActive().toast('No plan tab found (a row with Username and Day).');
@@ -132,6 +131,22 @@ function setupDropdowns() {
     ]);
   }
   SpreadsheetApp.getActive().toast('Dropdowns are ready on the "' + sh.getName() + '" tab.');
+}
+
+/**
+ * Show times in Ottawa time. New sheets default to Pacific time, which made the Status tab 3 hours
+ * off. A sheet stores a time as it reads in the sheet's time zone when written, so changing the
+ * zone alone would leave the rows already there 3 hours off: they are read first (as real moments)
+ * and written back after the change, which puts them in Ottawa time too.
+ */
+function fixTimeZone_() {
+  var ss = SpreadsheetApp.getActive();
+  if (ss.getSpreadsheetTimeZone() === TZ) return;
+  var s = ss.getSheetByName(STATUS);
+  var when = s && s.getLastRow() > 1 ? s.getRange(2, 1, s.getLastRow() - 1, 1).getValues() : null;
+  ss.setSpreadsheetTimeZone(TZ);
+  SpreadsheetApp.flush();
+  if (when) s.getRange(2, 1, when.length, 1).setValues(when);
 }
 
 /** The tab with the plan: the first one with a row containing Username and Day. */
