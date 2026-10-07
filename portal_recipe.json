@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "verified": true,
   "notes": "Mapped on the live portal 2026-09-29: Self Service > Book a Specific Room > Group Study Spaces > room > duration/time window > Verify Calendar > date > Book > Confirm > OK popup. A dry run stops before the final OK, so nothing is booked. Verified end to end 2026-09-29 (real booking #152358 succeeded). Rooms must be named like 'CB 2103'; bookable Canal Building study rooms are CB 2103, 2302, 3102, 3201, 3208.",
   "date_format": "%Y-%m-%d",
@@ -8,7 +8,16 @@
   "race": {
     "refresh": [{"action": "click", "selector": "#btnAnyDate", "timeout": 5000, "note": "Verify Calendar again"}],
     "ready": "td.dayAvailable:has(#day{date_epoch})",
-    "clock_url": "https://booking.carleton.ca/"
+    "clock_url": "https://booking.carleton.ca/",
+    "direct": {
+      "about": "Skip the calendar at the open time: ask for the start-time list directly (the request the portal makes when a date is picked) and click Book from the answer. room_id and request_type are read from the calendar request made while getting ready.",
+      "capture": {"url": "AvailabilityCalendar.php", "fields": {"room_id": "selectedRoomId", "request_type": "cboRequestType"}},
+      "url": "https://booking.carleton.ca/Portal/Services/SelfServiceRoomAvailability.php",
+      "form": "startDate={date_epoch}&startTime={start_min}&duration={duration_min}&endTime={end_min}&requestType={request_type}&roomId={room_id}&originalRequestID=00000000-0000-0000-0000-000000000000&minCapacity=0&minArea=0&roomTypes=&characteristics=&configurationTypes=&selectedInventoryItems=[]&selfService=1",
+      "answer_marker": "Room Availability",
+      "grab": [{"action": "click", "selector": "#cb-direct input[value='Book']", "timeout": 20000, "note": "Click Book from the start-time list (asked for directly; opens the confirmation page, does not book yet)"}],
+      "then": "Wait for the confirmation page"
+    }
   },
   "login": [
     {"action": "goto", "url": "https://booking.carleton.ca/index.php?p=Index"},

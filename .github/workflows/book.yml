@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test = dry run right now (nothing booked). now = really book every open day in the plan right now. book = wait for the next midnight and book."
+        description: "test = dry run right now (nothing booked). now = really book every open day in the plan right now. book = wait for the next midnight and book. trace = dry run that records the portal's requests (for working on the bot)."
         type: choice
-        options: [test, now, book]
+        options: [test, now, book, trace]
         default: test
       dates:
         description: "With now or test: only these days, like 2026-10-02, 2026-10-06. Blank = every open day in the plan."

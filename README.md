@@ -49,7 +49,7 @@ Don't use both options for the same account.
 
 ## How it books
 
-About 2.5 minutes before midnight it signs in and opens a tab for each room and time choice (up to 6), each filled in up to the calendar. It reads the portal's clock, and from 3 seconds before midnight every tab re-checks the calendar every 1.5 seconds. The first choice that opens is booked, usually within a couple of seconds. If someone grabs your first choice, the next one is already on screen. If nothing opened, it keeps retrying for 20 minutes.
+About 2.5 minutes before midnight it opens a tab for each room and time choice (up to 6), each with its own sign-in (the portal answers one sign-in's requests one at a time), filled in up to the calendar. It reads the portal's clock. Right at midnight (spread 0.1 s either side across the tabs, in case the clock reading is slightly off), each tab skips the calendar: it asks the portal directly for that room's start-time list, again as soon as each answer is back, and clicks Book from the answer. The first choice that opens is booked, usually within about a second. If a tab gets an answer it doesn't recognise, it goes back to re-checking the calendar. If someone grabs your first choice, the next one is already on screen. If nothing opened, it keeps retrying for 20 minutes.
 
 Please cancel any booking you won't use through the portal. Unused rooms block other students, and the portal shows who booked them.
 
