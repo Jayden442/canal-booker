@@ -17,6 +17,8 @@ Step format:
 Optional keys: "optional": true, "timeout": ms, "note": "...",
   "on_fail": "unavailable" | "login_failed" | "error",
   "submit": true  (a dry run stops right before this step),
+  "clear": "selector"  (click only: if this shows, e.g. an info popup, close it first; no waiting),
+  "fail_if": "selector"  (expect only: fail early if this shows instead and stays 0.6 s),
   "race_start": true  (midnight mode: steps before this are done early, steps from here on
                        run once the "race.ready" selector shows up after "race.refresh").
 Placeholders: {username} {password} {room} {date} {start} {end} {title} {attendees} {day}
@@ -103,7 +105,20 @@ def run_steps(page, steps, ctx, dry_run=False, settle=False, timings=None):
                 page.wait_for_timeout(step.get("ms", 1000))
             else:
                 loc = page.locator(_render(step["selector"], ctx)).first
-                if action == "click":
+                if action == "click" and step.get("clear"):
+                    # Click, closing the "clear" element first if it is showing (an info popup), at
+                    # once and again whenever a try fails, instead of always waiting for it to appear.
+                    blocker = page.locator(_render(step["clear"], ctx)).first
+                    while True:
+                        try:
+                            if blocker.is_visible():
+                                blocker.click(timeout=2000)
+                            loc.click(timeout=500)
+                            break
+                        except Exception:
+                            if time.time() - started > timeout / 1000:
+                                raise
+                elif action == "click":
                     loc.click(timeout=timeout)
                 elif action == "fill":
                     loc.fill(str(_render(step.get("value", ""), ctx)), timeout=timeout)
@@ -117,6 +132,21 @@ def run_steps(page, steps, ctx, dry_run=False, settle=False, timings=None):
                     loc.press(step.get("key", "Enter"), timeout=timeout)
                 elif action == "check":
                     loc.check(timeout=timeout)
+                elif action == "expect" and step.get("fail_if"):
+                    # Wait for the selector, but stop early if "fail_if" shows instead (and stays for
+                    # 0.6 s, so a passing "please wait" doesn't count): the portal said no.
+                    bad = page.locator(_render(step["fail_if"], ctx) + " >> visible=true").first
+                    bad_since = None
+                    while not loc.is_visible():
+                        if bad.count():
+                            bad_since = bad_since or time.time()
+                            if time.time() - bad_since > 0.6:
+                                raise RuntimeError("The portal said: " + " ".join(bad.inner_text().split())[:200])
+                        else:
+                            bad_since = None
+                        if time.time() - started > timeout / 1000:
+                            raise TimeoutError(f"'{step['selector']}' did not show within {timeout} ms")
+                        page.wait_for_timeout(20)
                 elif action == "expect":
                     loc.wait_for(state="visible", timeout=timeout)
                 else:
@@ -262,6 +292,75 @@ def _capture(direct, ctx):
     return on_request
 
 
+# Jumping straight to the confirmation page: the Book button calls
+# IS.Common.CreateRequest(type id, room id, date, start, duration, true, room setup ids), which posts
+# the booking form. The room setup ids come from any start-time list answer for that room.
+_CONFIG_JS = """([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include', headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
+  .then(r => r.text()).then(t => {
+    const d = new DOMParser().parseFromString(t, 'text/html');
+    for (const div of d.querySelectorAll('.listDiv')) {
+      let data; try { data = JSON.parse(div.getAttribute('data-listData')); } catch (e) { continue; }
+      for (const row of (data.RowData || [])) {
+        const box = document.createElement('div'); box.innerHTML = String((row.rowData || [])[1] || '');
+        const b = box.querySelector('[data-roomConfigsByRequestType]');
+        if (b) return b.getAttribute('data-roomConfigsByRequestType');
+      }
+    }
+    return null; })"""
+_JUMP_JS = """([rt, room, d, st, dur, cfg]) => {
+  if (!(window.IS && IS.Common && IS.Common.CreateRequest)) return 'no CreateRequest on this page';
+  IS.Common.CreateRequest(rt, room, d, st, dur, true, cfg); }"""
+# What the page shows after a jump: the confirmation page, a message box, or something else.
+_JUMP_SEEN = """() => {
+  const box = document.querySelector('.MessageBoxWindow, .MessageBoxText');
+  const text = box ? box.innerText.replace(/\\s+/g, ' ').slice(0, 200) : '';
+  if (document.querySelector('#btnConfirm')) return 'confirmation page' + (text ? ' with message: ' + text : '');
+  if (text) return 'message: ' + text;
+  return null; }"""
+
+
+def _room_config(page, direct, ctx):
+    """The room setup ids (data-roomConfigsByRequestType) from a start-time list answer for this room
+    on any open day, today first. None if no open day had a free start time in the window asked."""
+    for k in range(8):
+        d = dt.date.today() + dt.timedelta(days=k)
+        form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(d.timetuple())}",
+                      _render(direct["form"], dict(ctx, start_min=420, end_min=1380)))
+        try:
+            cfg = page.evaluate(_CONFIG_JS, [direct["url"], form])
+        except Exception:
+            cfg = None
+        if cfg:
+            return cfg
+    return None
+
+
+def _jump(page, ctx, cfg, limit=5.0):
+    """Call the Book button's function directly and say what page it led to (within limit s)."""
+    started = time.time()
+    try:
+        missing = page.evaluate(_JUMP_JS, [ctx["request_type"], ctx["room_id"], ctx["date_epoch"],
+                                           ctx["start_min"], ctx["duration_min"], cfg])
+        if missing:
+            return missing
+    except Exception as e:
+        if "context was destroyed" not in str(e) and "navigat" not in str(e).lower():
+            return f"call failed: {str(e).splitlines()[0][:120]}"
+    while time.time() - started < limit:
+        try:
+            seen = page.evaluate(_JUMP_SEEN)
+            if seen:
+                return seen
+        except Exception:
+            pass  # between pages
+        page.wait_for_timeout(20)
+    try:
+        return f"nothing recognised; page {page.url.split('?')[-1][:60]}"
+    except Exception:
+        return "nothing recognised"
+
+
 def _step_label(err: StepFailed):
     return err.step.get("note") or f"{err.step.get('action')} {err.step.get('selector', err.step.get('url', ''))}"
 
@@ -374,6 +473,11 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
     then = next((i for i, s in enumerate(grab) if direct.get("then") and
                  (s.get("note") or "").startswith(direct["then"])), None)
     direct_grab = (direct.get("grab", []) + grab[then:]) if then is not None and direct.get("url") else []
+    # With direct.preload, each tab opens its confirmation page before the open time (that books
+    # nothing) and, once its start-time list shows the time free, only needs Confirm and OK.
+    pre = next((i for i, s in enumerate(grab) if direct.get("preload_from") and
+                (s.get("note") or "").startswith(direct["preload_from"])), None)
+    preload_grab = grab[pre:] if pre is not None and direct_grab and direct.get("preload") else []
     times = slot.get("times") or storage.slot_times(slot)
     rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
     options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
@@ -435,8 +539,34 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             browser.close()
             return result
 
-        # Wait on the page until 3 seconds before the portal's clock reaches the open time.
+        # Wait on the page until 15 seconds before the portal's clock reaches the open time.
         already_open = time.time() >= open_local
+        while time.time() < open_local - 15:
+            first.wait_for_timeout(min(1000, max(50, (open_local - 15 - time.time()) * 1000)))
+
+        refresh = race.get("refresh", [])
+        # How long one calendar reload takes on the portal (fire, then wait until it is replaced).
+        reload_s = _measure_reload(tabs[0]["page"], refresh, tabs[0]["ctx"])
+        rapid = max(0.3, reload_s)
+        # A tab skips the calendar once its calendar request has given the room's ids. Playwright
+        # passes on request events only while it is busy, so give them up to a second to arrive.
+        fields = list((direct.get("capture") or {}).get("fields", {}))
+        captured = lambda t: bool(direct_grab) and bool(fields) and all(k in t["ctx"] for k in fields)
+        wait_until = time.time() + 1
+        while direct_grab and not all(captured(t) for t in tabs) and time.time() < wait_until:
+            first.wait_for_timeout(50)
+        configs = {}  # room -> the room's setup ids, read once per room
+        for t in tabs:
+            t["direct"] = captured(t)
+            t["preloaded"] = False
+            if t["direct"] and preload_grab:
+                if t["room"] not in configs:
+                    configs[t["room"]] = _room_config(t["page"], direct, t["ctx"])
+                t["cfg"] = configs[t["room"]]
+                if t["cfg"]:
+                    t["preloaded"] = _jump(t["page"], t["ctx"], t["cfg"]).startswith("confirmation page")
+
+        # Then until 3 seconds before.
         while time.time() < open_local - 3:
             first.wait_for_timeout(min(1000, max(50, (open_local - 3 - time.time()) * 1000)))
 
@@ -445,27 +575,14 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             return "(the day was already open)" if already_open else f"{max(after, 0):.1f} s after opening"
 
         deadline = max(open_local, time.time()) + window
-        refresh = race.get("refresh", [])
         ready_sel = race["ready"]
-        # How long one calendar reload takes on the portal (the last preparation step, measured above).
-        # Near the open time each waiting tab reloads again as soon as the last reload could be back.
-        reload_s = _measure_reload(tabs[0]["page"], refresh, tabs[0]["ctx"])
-        rapid = max(0.3, reload_s)
-        # First reload now (3 s early). The reload right at the open time is spread across the tabs
+        # First ask now (3 s early). The ask right at the open time is spread across the tabs
         # (0.1 s early, on time, 0.1 s late, and so on) so a small clock error doesn't cost a full
-        # extra reload: whichever tab lands first just after the opening sees the day.
-        # A tab skips the calendar once its calendar request has given the room's ids. Playwright
-        # passes on request events only while it is busy, so give them up to a second to arrive.
-        fields = list((direct.get("capture") or {}).get("fields", {}))
-        captured = lambda t: bool(direct_grab) and bool(fields) and all(k in t["ctx"] for k in fields)
-        wait_until = time.time() + 1
-        while direct_grab and not all(captured(t) for t in tabs) and time.time() < wait_until:
-            first.wait_for_timeout(50)
+        # extra round: whichever tab lands first just after the opening sees the day.
         switched = []  # tabs whose direct answer looked wrong and went back to the calendar
         for t in tabs:
             t["next"] = time.time()
             t["state"] = "none"
-            t["direct"] = captured(t)
         sync = f"Portal clock {offset:+.2f} s from ours; calendar reload {reload_s:.2f} s."
 
         def is_ready(t):
@@ -473,7 +590,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                 state, t["pending"] = _direct_state(t["page"])
                 t["state"] = state
                 if state == "odd":  # not a start-time list: use the calendar for this tab from now on
-                    t["direct"] = False
+                    t["direct"] = t["preloaded"] = False
                     switched.append(t["label"])
                 return state == "ready"
             try:
@@ -484,6 +601,9 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         def direct_note():
             used = sum(1 for t in tabs if t["direct"])
             text = f" {own} sign-in{'s' if own > 1 else ''} for {len(tabs)} tab{'s' if len(tabs) > 1 else ''}."
+            loaded = sum(1 for t in tabs if t["preloaded"])
+            if loaded:
+                text += f" Confirmation page opened ahead on {loaded} tab{'s' if loaded > 1 else ''}."
             text += (f" Start-time list asked for directly (calendar skipped) on {used} of {len(tabs)} tabs."
                     if used else " Calendar used." if switched
                     else " Calendar used (the direct start-time list was not set up).")
@@ -541,8 +661,24 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             try:
                 t["page"].bring_to_front()  # a tab in front is not slowed down by the browser
                 steps_timed = []
-                outcome = run_steps(t["page"], direct_grab if t["direct"] else grab, t["ctx"],
-                                    dry_run=dry_run, timings=steps_timed)
+                grab_started = time.time()
+                if t["preloaded"]:
+                    try:
+                        # The helper Book button is not needed here and must not cover Confirm.
+                        t["page"].evaluate("() => { const b = document.getElementById('cb-direct'); if (b) b.remove(); }")
+                        outcome = run_steps(t["page"], preload_grab, t["ctx"], dry_run=dry_run, timings=steps_timed)
+                    except StepFailed as e:
+                        # The page opened ahead was not accepted: open a fresh one and book as usual.
+                        steps_timed.append((f"Opened-ahead page failed at '{_step_label(e)}'", 0))
+                        if not _jump(t["page"], t["ctx"], t["cfg"]).startswith("confirmation page"):
+                            # The jump needs the portal's script: reload the first page, then jump.
+                            run_steps(t["page"], prepare[:1], t["ctx"])
+                            _jump(t["page"], t["ctx"], t["cfg"])
+                        outcome = run_steps(t["page"], grab[then:], t["ctx"], dry_run=dry_run, timings=steps_timed)
+                else:
+                    outcome = run_steps(t["page"], direct_grab if t["direct"] else grab, t["ctx"],
+                                        dry_run=dry_run, timings=steps_timed)
+                sent = _ok_sent(steps_timed, grab_started, offset, open_at, already_open)
                 when = _when()
                 shot = _shot(t["page"], f"{day}_race_{t['room']}_{outcome}")
                 # Say what happened to the choices tried before this one (taken by someone else, and when).
@@ -553,7 +689,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                                   message=f"Midnight mode dry run: {t['label']} was free {when}. Nothing was booked.{before}{timing}")
                 else:
                     result.update(room=t["room"], time=t["time"], status="booked", screenshot=shot,
-                                  message=f"Midnight mode booked {t['label']} {when}.{before}{timing}")
+                                  message=f"Midnight mode booked {t['label']} {when}{sent}.{before}{timing}")
                 browser.close()
                 return result
             except StepFailed as e:
@@ -571,6 +707,19 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         result["screenshot"] = _shot(tabs[0]["page"], f"{day}_race_nothing_booked")
         browser.close()
     return result
+
+
+def _ok_sent(timings, started, offset, open_at, already_open):
+    """' (OK sent 0.62 s after opening)': when the step that makes the booking was clicked, by the
+    portal's clock, from the step times. Empty if that step did not run or the day was already open."""
+    t, sent = started, None
+    for note, secs in timings:
+        t += secs
+        if note.startswith("Click OK"):
+            sent = t  # the last one counts (a first try on a page opened ahead can be refused)
+    if sent is None or already_open:
+        return ""
+    return f" (OK sent {max(sent + offset - open_at.timestamp(), 0):.2f} s after opening)"
 
 
 def _calendar_seen(tabs, day):
@@ -708,65 +857,38 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                     page.wait_for_timeout(20)
                     state = _direct_state(page)[0]
                 events.append(f"[Direct: ask for the list   ] +{time.time() - current['t0']:5.2f}s  answer: {state}")
-                # Does the portal answer one session's requests one at a time? Send 6 at once and
-                # time each answer (read only).
-                current.update(step="Direct: 6 lists at once", t0=time.time())
-                took = page.evaluate("""([u, f]) => { const t0 = performance.now();
-                    return Promise.all([0, 1, 2, 3, 4, 5].map(() => fetch(u, {method: 'POST', body: f,
-                        credentials: 'include', headers: {'Content-Type':
-                        'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
-                      .then(r => r.text()).then(() => Math.round(performance.now() - t0)))); }""",
-                                     [direct["url"], _render(direct["form"], dctx)])
-                events.append(f"[Direct: 6 lists at once    ] answers after (ms): {sorted(took)}")
-                outcome += f"; 6 lists at once answered after {sorted(took)} ms"
-                # One request for a wide window (7:00 to 23:00): which start times come back, for each
-                # of the next 8 days (read only)? Shows "open", "open but taken" and "not open yet".
-                wide = dict(dctx, start_min=420, end_min=1380)
-                for k in range(8):
-                    d = dt.date.today() + dt.timedelta(days=k)
-                    form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(d.timetuple())}",
-                                  _render(direct["form"], wide))
-                    text = page.evaluate("""([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                  'X-Requested-With': 'XMLHttpRequest'}}).then(r => r.text())""",
-                                         [direct["url"], form])
-                    starts = re.findall(r'\[\\?"(\d{1,2}:\d{2} [AP]M)\\?",(\d+)\]', text)
-                    warn = re.sub(r"<[^>]+>", " ", text.split('class="warning"', 1)[-1])[:160] if not starts else ""
-                    events.append(f"[Direct: wide window {d:%a %b %d}] starts: {[x[0] for x in starts]} "
-                                  f"{' '.join(warn.split())}")
-                # Do two sign-ins run side by side? Sign in again in a separate browser context (not
-                # recorded), send 3 lists from each session at the same moment, and check that the
-                # first session is still signed in afterwards.
-                page2 = browser.new_context().new_page()
-                ok2, msg2 = _login(page2, recipe, base, password)
-                if ok2:
-                    start3 = """([u, f, m]) => { window.__par = null; const t0 = performance.now();
-                        Promise.all([0, 1, 2].map(() => fetch(u, {method: 'POST', body: f, credentials: 'include',
-                            headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                      'X-Requested-With': 'XMLHttpRequest'}})
-                          .then(r => r.text()).then(t => [Math.round(performance.now() - t0), t.includes(m)])))
-                        .then(r => { window.__par = r; }); }"""
-                    args = [direct["url"], _render(direct["form"], dctx), direct.get("answer_marker", "")]
-                    page.evaluate(start3, args)
-                    page2.evaluate(start3, args)
-                    res = {}
-                    while len(res) < 2 and time.time() - current["t0"] < 15:
-                        for name, pg in (("first", page), ("second", page2)):
-                            got = pg.evaluate("() => window.__par")
-                            if got and name not in res:
-                                res[name] = got
-                        page.wait_for_timeout(20)
-                    outcome += f"; second sign-in OK, 3 lists from each session at once: {res}"
-                else:
-                    outcome += f"; second sign-in failed ({msg2})"
                 outcome += f" list answer '{state}'"
                 if state == "ready":
                     for step in direct.get("grab", []) + steps[then:]:
                         current.update(step="Direct: " + (step.get("note") or step.get("action")), t0=time.time())
                         if run_steps(page, [step], dctx, dry_run=True) == "dry_run":
                             outcome += ", stopped before the final OK (nothing booked)"
+                            # What the final popup looks like (its HTML, shortened), to recognise
+                            # success and failure messages after OK.
+                            popup = page.evaluate("""() => [...document.querySelectorAll(
+                                '.MessageBoxWindow, .MessageBoxText')].map(e => e.className + ' | ' +
+                                e.outerHTML.replace(/\\s+/g, ' ').slice(0, 600))""")
+                            for html in popup:
+                                events.append(f"[Final OK popup             ] {clean(html, 700)}")
                             break
                         events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  step done")
+                # Can the Book button's own call (IS.Common.CreateRequest) be made directly, with no
+                # list request first? Read the room's setup id from today's list, then open the
+                # confirmation page for a day that is not open yet and for the traced day. Confirm
+                # and OK are never clicked, so nothing is booked.
+                cfg = _room_config(page, direct, dctx)
+                events.append(f"[Jump: room setup id        ] {cfg}")
+                outcome += f"; room setup id {'read' if cfg else 'NOT read'}"
+                for label, d in (("not open yet", probe_day), ("open", day)):
+                    if not cfg or not d:
+                        continue
+                    page.goto(_render(steps[0]["url"], dctx), wait_until="domcontentloaded", timeout=30000)
+                    current.update(step=f"Jump: {label} {d:%b %d}", t0=time.time())
+                    jctx = dict(dctx, date_epoch=calendar.timegm(d.timetuple()))
+                    seen = _jump(page, jctx, cfg)
+                    took = time.time() - current["t0"]
+                    events.append(f"[Jump: {label:12} {d:%b %d}] +{took:5.2f}s  {seen}")
+                    outcome += f"; jump to the confirmation page for a day {label}: {seen} ({took:.2f} s)"
             except StepFailed as e:
                 outcome += f" stopped at '{_step_label(e)}' ({_scrub(e.detail, password)})"
             page.wait_for_timeout(500)

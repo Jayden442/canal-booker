@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "verified": true,
   "notes": "Mapped on the live portal 2026-09-29: Self Service > Book a Specific Room > Group Study Spaces > room > duration/time window > Verify Calendar > date > Book > Confirm > OK popup. A dry run stops before the final OK, so nothing is booked. Verified end to end 2026-09-29 (real booking #152358 succeeded). Rooms must be named like 'CB 2103'; bookable Canal Building study rooms are CB 2103, 2302, 3102, 3201, 3208.",
   "date_format": "%Y-%m-%d",
@@ -10,13 +10,15 @@
     "ready": "td.dayAvailable:has(#day{date_epoch})",
     "clock_url": "https://booking.carleton.ca/",
     "direct": {
-      "about": "Skip the calendar at the open time: ask for the start-time list directly (the request the portal makes when a date is picked) and click Book from the answer. room_id and request_type are read from the calendar request made while getting ready.",
+      "about": "Skip the calendar at the open time: ask for the start-time list directly (the request the portal makes when a date is picked) and click Book from the answer. room_id and request_type are read from the calendar request made while getting ready. With preload, each tab opens its confirmation page shortly before the open time (that books nothing) and, once its start-time list shows the time free, clicks Confirm and OK; if that page is not accepted, it opens a fresh one and books as usual.",
       "capture": {"url": "AvailabilityCalendar.php", "fields": {"room_id": "selectedRoomId", "request_type": "cboRequestType"}},
       "url": "https://booking.carleton.ca/Portal/Services/SelfServiceRoomAvailability.php",
       "form": "startDate={date_epoch}&startTime={start_min}&duration={duration_min}&endTime={end_min}&requestType={request_type}&roomId={room_id}&originalRequestID=00000000-0000-0000-0000-000000000000&minCapacity=0&minArea=0&roomTypes=&characteristics=&configurationTypes=&selectedInventoryItems=[]&selfService=1",
       "answer_marker": "Room Availability",
       "grab": [{"action": "click", "selector": "#cb-direct input[value='Book']", "timeout": 20000, "note": "Click Book from the start-time list (asked for directly; opens the confirmation page, does not book yet)"}],
-      "then": "Wait for the confirmation page"
+      "then": "Wait for the confirmation page",
+      "preload": true,
+      "preload_from": "Click Confirm"
     }
   },
   "login": [
@@ -40,9 +42,8 @@
     {"action": "expect", "selector": "tr:has(td:text-is('{start}')) input[value='Book']", "timeout": 700, "on_fail": "unavailable", "note": "Check the start time is still in the list (gone means someone took it)"},
     {"action": "click", "selector": "tr:has(td:text-is('{start}')) input[value='Book']", "timeout": 20000, "note": "Click Book next to the start time (opens the confirmation page, does not book yet)"},
     {"action": "expect", "selector": "#btnConfirm, .MessageBoxWindow #btnOK", "timeout": 20000, "note": "Wait for the confirmation page (or an info popup on it)"},
-    {"action": "click", "selector": ".MessageBoxWindow #btnOK", "optional": true, "timeout": 150, "note": "Close an info popup if one appears"},
-    {"action": "click", "selector": "#btnConfirm", "timeout": 20000, "note": "Click Confirm on the Booking Confirmation page (opens the final OK popup)"},
+    {"action": "click", "selector": "#btnConfirm", "clear": ".MessageBoxWindow:not(:has-text('confirm this booking')) #btnOK", "timeout": 20000, "note": "Click Confirm on the Booking Confirmation page (opens the final OK popup; closes an info popup first if one is showing)"},
     {"action": "click", "selector": ".MessageBoxWindow:has-text('confirm this booking') #btnOK", "submit": true, "note": "Click OK in 'Select OK to confirm this booking.' (this makes the booking)"},
-    {"action": "expect", "selector": ".MessageBoxText:has-text('Booking saved successfully')", "timeout": 20000, "note": "Portal says 'Booking saved successfully. (Booking #...)'"}
+    {"action": "expect", "selector": ".MessageBoxText:has-text('Booking saved successfully')", "fail_if": ".MessageBoxText:not(:has-text('Booking saved')):not(:has-text('confirm this booking'))", "timeout": 20000, "note": "Portal says 'Booking saved successfully. (Booking #...)'"}
   ]
 }
