@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "verified": true,
   "notes": "Mapped on the live portal 2026-09-29: Self Service > Book a Specific Room > Group Study Spaces > room > duration/time window > Verify Calendar > date > Book > Confirm > OK popup. A dry run stops before the final OK, so nothing is booked. Verified end to end 2026-09-29 (real booking #152358 succeeded). Rooms must be named like 'CB 2103'; bookable Canal Building study rooms are CB 2103, 2302, 3102, 3201, 3208.",
   "date_format": "%Y-%m-%d",
@@ -40,8 +40,7 @@
     {"action": "expect", "selector": "tr:has(td:text-is('{start}')) input[value='Book']", "timeout": 700, "on_fail": "unavailable", "note": "Check the start time is still in the list (gone means someone took it)"},
     {"action": "click", "selector": "tr:has(td:text-is('{start}')) input[value='Book']", "timeout": 20000, "note": "Click Book next to the start time (opens the confirmation page, does not book yet)"},
     {"action": "expect", "selector": "#btnConfirm, .MessageBoxWindow #btnOK", "timeout": 20000, "note": "Wait for the confirmation page (or an info popup on it)"},
-    {"action": "click", "selector": ".MessageBoxWindow #btnOK", "optional": true, "timeout": 150, "note": "Close an info popup if one appears"},
-    {"action": "click", "selector": "#btnConfirm", "timeout": 20000, "note": "Click Confirm on the Booking Confirmation page (opens the final OK popup)"},
+    {"action": "click", "selector": "#btnConfirm", "clear": ".MessageBoxWindow:not(:has-text('confirm this booking')) #btnOK", "timeout": 20000, "note": "Click Confirm on the Booking Confirmation page (opens the final OK popup; closes an info popup first if one is showing)"},
     {"action": "click", "selector": ".MessageBoxWindow:has-text('confirm this booking') #btnOK", "submit": true, "note": "Click OK in 'Select OK to confirm this booking.' (this makes the booking)"},
     {"action": "expect", "selector": ".MessageBoxText:has-text('Booking saved successfully')", "timeout": 20000, "note": "Portal says 'Booking saved successfully. (Booking #...)'"}
   ]

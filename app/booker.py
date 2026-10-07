@@ -17,6 +17,7 @@ Step format:
 Optional keys: "optional": true, "timeout": ms, "note": "...",
   "on_fail": "unavailable" | "login_failed" | "error",
   "submit": true  (a dry run stops right before this step),
+  "clear": "selector"  (click only: if this shows, e.g. an info popup, close it first; no waiting),
   "race_start": true  (midnight mode: steps before this are done early, steps from here on
                        run once the "race.ready" selector shows up after "race.refresh").
 Placeholders: {username} {password} {room} {date} {start} {end} {title} {attendees} {day}
@@ -103,7 +104,20 @@ def run_steps(page, steps, ctx, dry_run=False, settle=False, timings=None):
                 page.wait_for_timeout(step.get("ms", 1000))
             else:
                 loc = page.locator(_render(step["selector"], ctx)).first
-                if action == "click":
+                if action == "click" and step.get("clear"):
+                    # Click, closing the "clear" element first if it is showing (an info popup), at
+                    # once and again whenever a try fails, instead of always waiting for it to appear.
+                    blocker = page.locator(_render(step["clear"], ctx)).first
+                    while True:
+                        try:
+                            if blocker.is_visible():
+                                blocker.click(timeout=2000)
+                            loc.click(timeout=500)
+                            break
+                        except Exception:
+                            if time.time() - started > timeout / 1000:
+                                raise
+                elif action == "click":
                     loc.click(timeout=timeout)
                 elif action == "fill":
                     loc.fill(str(_render(step.get("value", ""), ctx)), timeout=timeout)
@@ -260,6 +274,71 @@ def _capture(direct, ctx):
         except Exception:
             pass
     return on_request
+
+
+# Jumping straight to the confirmation page: the Book button calls
+# IS.Common.CreateRequest(type id, room id, date, start, duration, true, room setup ids), which posts
+# the booking form. The room setup ids come from any start-time list answer for that room.
+_CONFIG_JS = """([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include', headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
+  .then(r => r.text()).then(t => {
+    const d = new DOMParser().parseFromString(t, 'text/html');
+    for (const div of d.querySelectorAll('.listDiv')) {
+      let data; try { data = JSON.parse(div.getAttribute('data-listData')); } catch (e) { continue; }
+      for (const row of (data.RowData || [])) {
+        const box = document.createElement('div'); box.innerHTML = String((row.rowData || [])[1] || '');
+        const b = box.querySelector('[data-roomConfigsByRequestType]');
+        if (b) return b.getAttribute('data-roomConfigsByRequestType');
+      }
+    }
+    return null; })"""
+_JUMP_JS = """([rt, room, d, st, dur, cfg]) => { IS.Common.CreateRequest(rt, room, d, st, dur, true, cfg); }"""
+# What the page shows after a jump: the confirmation page, a message box, or something else.
+_JUMP_SEEN = """() => {
+  const box = document.querySelector('.MessageBoxWindow, .MessageBoxText');
+  const text = box ? box.innerText.replace(/\\s+/g, ' ').slice(0, 200) : '';
+  if (document.querySelector('#btnConfirm')) return 'confirmation page' + (text ? ' with message: ' + text : '');
+  if (text) return 'message: ' + text;
+  return null; }"""
+
+
+def _room_config(page, direct, ctx):
+    """The room setup ids (data-roomConfigsByRequestType) from a start-time list answer for this room
+    on any open day, today first. None if no open day had a free start time in the window asked."""
+    for k in range(8):
+        d = dt.date.today() + dt.timedelta(days=k)
+        form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(d.timetuple())}",
+                      _render(direct["form"], dict(ctx, start_min=420, end_min=1380)))
+        try:
+            cfg = page.evaluate(_CONFIG_JS, [direct["url"], form])
+        except Exception:
+            cfg = None
+        if cfg:
+            return cfg
+    return None
+
+
+def _jump(page, ctx, cfg, limit=5.0):
+    """Call the Book button's function directly and say what page it led to (within limit s)."""
+    started = time.time()
+    try:
+        page.evaluate(_JUMP_JS, [ctx["request_type"], ctx["room_id"], ctx["date_epoch"],
+                                 ctx["start_min"], ctx["duration_min"], cfg])
+    except Exception as e:
+        if "context was destroyed" not in str(e) and "navigat" not in str(e).lower():
+            return f"call failed: {str(e).splitlines()[0][:120]}"
+    while time.time() - started < limit:
+        try:
+            seen = page.evaluate(_JUMP_SEEN)
+            if seen:
+                return seen
+        except Exception:
+            pass  # between pages
+        page.wait_for_timeout(20)
+    try:
+        return f"nothing recognised; page {page.url.split('?')[-1][:60]}"
+    except Exception:
+        return "nothing recognised"
 
 
 def _step_label(err: StepFailed):
@@ -708,57 +787,6 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                     page.wait_for_timeout(20)
                     state = _direct_state(page)[0]
                 events.append(f"[Direct: ask for the list   ] +{time.time() - current['t0']:5.2f}s  answer: {state}")
-                # Does the portal answer one session's requests one at a time? Send 6 at once and
-                # time each answer (read only).
-                current.update(step="Direct: 6 lists at once", t0=time.time())
-                took = page.evaluate("""([u, f]) => { const t0 = performance.now();
-                    return Promise.all([0, 1, 2, 3, 4, 5].map(() => fetch(u, {method: 'POST', body: f,
-                        credentials: 'include', headers: {'Content-Type':
-                        'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}})
-                      .then(r => r.text()).then(() => Math.round(performance.now() - t0)))); }""",
-                                     [direct["url"], _render(direct["form"], dctx)])
-                events.append(f"[Direct: 6 lists at once    ] answers after (ms): {sorted(took)}")
-                outcome += f"; 6 lists at once answered after {sorted(took)} ms"
-                # One request for a wide window (7:00 to 23:00): which start times come back, for each
-                # of the next 8 days (read only)? Shows "open", "open but taken" and "not open yet".
-                wide = dict(dctx, start_min=420, end_min=1380)
-                for k in range(8):
-                    d = dt.date.today() + dt.timedelta(days=k)
-                    form = re.sub(r"startDate=\d+", f"startDate={calendar.timegm(d.timetuple())}",
-                                  _render(direct["form"], wide))
-                    text = page.evaluate("""([u, f]) => fetch(u, {method: 'POST', body: f, credentials: 'include',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                  'X-Requested-With': 'XMLHttpRequest'}}).then(r => r.text())""",
-                                         [direct["url"], form])
-                    starts = re.findall(r'\[\\?"(\d{1,2}:\d{2} [AP]M)\\?",(\d+)\]', text)
-                    warn = re.sub(r"<[^>]+>", " ", text.split('class="warning"', 1)[-1])[:160] if not starts else ""
-                    events.append(f"[Direct: wide window {d:%a %b %d}] starts: {[x[0] for x in starts]} "
-                                  f"{' '.join(warn.split())}")
-                # Do two sign-ins run side by side? Sign in again in a separate browser context (not
-                # recorded), send 3 lists from each session at the same moment, and check that the
-                # first session is still signed in afterwards.
-                page2 = browser.new_context().new_page()
-                ok2, msg2 = _login(page2, recipe, base, password)
-                if ok2:
-                    start3 = """([u, f, m]) => { window.__par = null; const t0 = performance.now();
-                        Promise.all([0, 1, 2].map(() => fetch(u, {method: 'POST', body: f, credentials: 'include',
-                            headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                      'X-Requested-With': 'XMLHttpRequest'}})
-                          .then(r => r.text()).then(t => [Math.round(performance.now() - t0), t.includes(m)])))
-                        .then(r => { window.__par = r; }); }"""
-                    args = [direct["url"], _render(direct["form"], dctx), direct.get("answer_marker", "")]
-                    page.evaluate(start3, args)
-                    page2.evaluate(start3, args)
-                    res = {}
-                    while len(res) < 2 and time.time() - current["t0"] < 15:
-                        for name, pg in (("first", page), ("second", page2)):
-                            got = pg.evaluate("() => window.__par")
-                            if got and name not in res:
-                                res[name] = got
-                        page.wait_for_timeout(20)
-                    outcome += f"; second sign-in OK, 3 lists from each session at once: {res}"
-                else:
-                    outcome += f"; second sign-in failed ({msg2})"
                 outcome += f" list answer '{state}'"
                 if state == "ready":
                     for step in direct.get("grab", []) + steps[then:]:
@@ -767,6 +795,23 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                             outcome += ", stopped before the final OK (nothing booked)"
                             break
                         events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  step done")
+                # Can the Book button's own call (IS.Common.CreateRequest) be made directly, with no
+                # list request first? Read the room's setup id from today's list, then open the
+                # confirmation page for a day that is not open yet and for the traced day. Confirm
+                # and OK are never clicked, so nothing is booked.
+                cfg = _room_config(page, direct, dctx)
+                events.append(f"[Jump: room setup id        ] {cfg}")
+                outcome += f"; room setup id {'read' if cfg else 'NOT read'}"
+                for label, d in (("not open yet", probe_day), ("open", day)):
+                    if not cfg or not d:
+                        continue
+                    page.goto(_render(steps[0]["url"], dctx), wait_until="domcontentloaded", timeout=30000)
+                    current.update(step=f"Jump: {label} {d:%b %d}", t0=time.time())
+                    jctx = dict(dctx, date_epoch=calendar.timegm(d.timetuple()))
+                    seen = _jump(page, jctx, cfg)
+                    took = time.time() - current["t0"]
+                    events.append(f"[Jump: {label:12} {d:%b %d}] +{took:5.2f}s  {seen}")
+                    outcome += f"; jump to the confirmation page for a day {label}: {seen} ({took:.2f} s)"
             except StepFailed as e:
                 outcome += f" stopped at '{_step_label(e)}' ({_scrub(e.detail, password)})"
             page.wait_for_timeout(500)
