@@ -793,6 +793,13 @@ def trace_booking(settings, password, recipe, day, slot, probe_day=None):
                         current.update(step="Direct: " + (step.get("note") or step.get("action")), t0=time.time())
                         if run_steps(page, [step], dctx, dry_run=True) == "dry_run":
                             outcome += ", stopped before the final OK (nothing booked)"
+                            # What the final popup looks like (its HTML, shortened), to recognise
+                            # success and failure messages after OK.
+                            popup = page.evaluate("""() => [...document.querySelectorAll(
+                                '.MessageBoxWindow, .MessageBoxText')].map(e => e.className + ' | ' +
+                                e.outerHTML.replace(/\\s+/g, ' ').slice(0, 600))""")
+                            for html in popup:
+                                events.append(f"[Final OK popup             ] {clean(html, 700)}")
                             break
                         events.append(f"[{current['step'][:28]:28}] +{time.time() - current['t0']:5.2f}s  step done")
                 # Can the Book button's own call (IS.Common.CreateRequest) be made directly, with no
