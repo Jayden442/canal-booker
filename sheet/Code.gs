@@ -421,7 +421,7 @@ function doPost(e) {
   }
   if (/^Booked/.test(clean_(d.result))) {
     try { refreshBookings(); } catch (err) { /* the page catches up at the nightly refresh */ }
-    try { refreshAnalytics(); } catch (err) { /* the sheet catches up at the nightly refresh */ }
+    refreshAnalytics();
   }
   return reply_('ok');
 }
