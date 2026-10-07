@@ -480,10 +480,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
     preload_grab = grab[pre:] if pre is not None and direct_grab and direct.get("preload") else []
     times = slot.get("times") or storage.slot_times(slot)
     rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
-    options = [(r, t) for t in times for r in rooms][:MAX_RACE_TABS]
-    print(f"[booking] midnight inputs: date={day.isoformat()} rooms={rooms!r} times={times!r}", flush=True)
-    print(f"[booking] midnight priority order (first {MAX_RACE_TABS} choices max): " + "; ".join(
-        f"{i}. {room} {start}-{end}" for i, (room, (start, end)) in enumerate(options, 1)), flush=True)
+    options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
     poll = int(settings.get("race_poll_ms", 1500)) / 1000
     window = int(settings.get("race_window_seconds", 120))
     base = _base_ctx(settings, password)
@@ -526,8 +523,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                 try:
                     run_steps(page, prepare, ctx, settle=True)
                     tabs.append({"page": page, "ctx": ctx, "label": label, "room": room,
-                                 "time": f"{start_text}-{end_text}", "choice_index": i + 1, "alive": True})
-                    print(f"[booking] prepared midnight choice {i + 1}: {label}", flush=True)
+                                 "time": f"{start_text}-{end_text}", "alive": True})
                     break
                 except StepFailed as e:
                     # Start the tab over from the first page, unless the open time is under
@@ -536,8 +532,6 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                         continue
                     notes.append(f"{label} could not get ready at '{_step_label(e)}' "
                                  f"({_scrub(e.detail, password)})")
-                    print(f"[booking] could not prepare midnight choice {i + 1}: {label} ({_step_label(e)})",
-                          flush=True)
                     _shot(page, f"{day}_race_prepare_{room}_{start_text}")
         if not tabs:
             result.update(status="error", message="Midnight mode: no choice got ready. " + "; ".join(notes),
@@ -924,15 +918,9 @@ def run_bookings(settings, password, recipe, targets, dry_run=False):
             # First room at each time in order, then the next room, and so on.
             times = slot.get("times") or storage.slot_times(slot)
             rooms = slot.get("rooms") or settings["rooms"]
-            choices = [(r, t) for t in times for r in rooms]
-            print(f"[booking] inputs: date={day.isoformat()} slot={storage.slot_key(slot)!r} "
-                  f"rooms={rooms!r} times={times!r}", flush=True)
-            print("[booking] priority order: " + "; ".join(
-                f"{i}. {room} {start}-{end}" for i, (room, (start, end)) in enumerate(choices, 1)), flush=True)
-            for i, (room, (start_text, end_text)) in enumerate(choices, 1):
+            for room, (start_text, end_text) in [(r, t) for r in rooms for t in times]:
                 label = f"{room} {start_text}-{end_text}"
                 ctx = _ctx(base, recipe, day, room, start_text, end_text)
-                print(f"[booking] attempting choice {i}/{len(choices)}: {label}", flush=True)
                 try:
                     outcome = run_steps(page, recipe.get("book", []), ctx, dry_run=dry_run, settle=True)
                     shot = _shot(page, f"{day}_{start_text}_{room}_{outcome}")
@@ -943,17 +931,14 @@ def run_bookings(settings, password, recipe, targets, dry_run=False):
                     else:
                         result.update(room=room, time=booked_time, status="booked", screenshot=shot,
                                       message=f"Booked {label}.")
-                    print(f"[booking] choice {i} {outcome}: {label}", flush=True)
                     break
                 except StepFailed as e:
                     shot = _shot(page, f"{day}_{start_text}_{room}_{e.outcome}")
                     if e.outcome == "unavailable":
-                        print(f"[booking] choice {i} unavailable: {label}", flush=True)
                         tried.append(f"{label} taken")
                         result.update(screenshot=shot, message="Taken: " + ", ".join(tried) + ".")
                         continue
                     tried.append(f"{label} failed at '{_step_label(e)}'")
-                    print(f"[booking] choice {i} failed ({e.outcome}): {label} at {_step_label(e)}", flush=True)
                     result.update(status="error", screenshot=shot,
                                   message="; ".join(tried) + f". Detail: {_scrub(e.detail, password)}")
                     if dry_run:

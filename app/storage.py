@@ -99,9 +99,6 @@ def load_settings() -> dict:
         s = dict(DEFAULT_SETTINGS)
         s.update(_read_json(resource_path("app_defaults.json"), {}))
         s.update(_read_json(data_dir() / "settings.json", {}))
-        log = load_log()
-        if log:
-            log.append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "status": f"loaded settings: {s}"})
         return s
 
 
@@ -110,9 +107,6 @@ def save_settings(new: dict) -> dict:
         s = load_settings()
         s.update({k: v for k, v in new.items() if k in DEFAULT_SETTINGS})
         _write_json(data_dir() / "settings.json", s)
-        log = load_log()
-        if log:
-            log.append({"ts": dt.datetime.now().isoformat(timespec="seconds"), "status": f"saved settings: {s}"})
         return s
 
 
