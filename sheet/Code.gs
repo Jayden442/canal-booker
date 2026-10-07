@@ -374,7 +374,7 @@ function refreshAnalytics() {
       c.avg_time = c.total_seconds/c.midnight_booked_entries;
     }
     else {
-      counts[i].avg_time = "None";
+      c.avg_time = "None";
     }
   })
   sh.getRange(4, 1, 7, 4).setValues([
