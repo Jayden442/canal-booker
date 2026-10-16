@@ -451,6 +451,35 @@ MAX_RACE_TABS = 6
 PREPARE_TRIES = 3
 
 
+def order_options(rooms, times, team_mains=()):
+    """Every (room, (start, end)) choice in order: all times in the first room, then the next room.
+    A teammate's main choice that day (their first room at their main time) goes to the end, so
+    one person's backup doesn't take another person's main room. Your own main stays first."""
+    options = [(r, t) for r in rooms for t in times]
+    theirs = {(m[0], m[1], m[2]) for m in team_mains}
+    if not options or not theirs:
+        return options
+    own, rest = options[0], options[1:]
+    clash = lambda o: (o[0], o[1][0], o[1][1]) in theirs
+    return [own] + [o for o in rest if not clash(o)] + [o for o in rest if clash(o)]
+
+
+def pick_tab(tabs, ready, already_open, now_portal, open_ts, spec_done, enabled=True):
+    """Which tab to book now that at least one tab sees the day open. Returns (tab, speculative).
+
+    The whole day opens at once, so the first answer that shows any choice free means the top
+    choice is very likely free too. Instead of waiting for the top choice's own answer (about a
+    second when the portal is busy, during which a lower choice could be booked), book the top
+    choice straight away from its confirmation page opened ahead. This is done once per night:
+    if the top choice turns out to be taken, the normal order takes over."""
+    alive = [t for t in tabs if t["alive"]]
+    top = alive[0] if alive else None
+    if (enabled and top is not None and top not in ready and not spec_done and not already_open
+            and top.get("preloaded") and now_portal >= open_ts):
+        return top, True
+    return (ready[0] if ready else None), False
+
+
 def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
     """Midnight mode for one day that is about to open.
 
@@ -480,7 +509,9 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
     preload_grab = grab[pre:] if pre is not None and direct_grab and direct.get("preload") else []
     times = slot.get("times") or storage.slot_times(slot)
     rooms = slot.get("rooms") or settings["rooms"]  # that day's rooms from the plan, else the person's
-    options = [(r, t) for r in rooms for t in times][:MAX_RACE_TABS]
+    team_mains = (settings.get("team_mains") or {}).get(slot.get("day") or storage.DAYS[day.weekday()], [])
+    options = order_options(rooms, times, team_mains)[:MAX_RACE_TABS]
+    book_on_open = bool(settings.get("race_book_on_open", True))
     poll = int(settings.get("race_poll_ms", 1500)) / 1000
     window = int(settings.get("race_window_seconds", 120))
     base = _base_ctx(settings, password)
@@ -580,6 +611,7 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
         # (0.1 s early, on time, 0.1 s late, and so on) so a small clock error doesn't cost a full
         # extra round: whichever tab lands first just after the opening sees the day.
         switched = []  # tabs whose direct answer looked wrong and went back to the calendar
+        spec_done = False  # the top choice was booked on the first sign the day was open
         for t in tabs:
             t["next"] = time.time()
             t["state"] = "none"
@@ -649,15 +681,25 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
             if not ready:
                 first.wait_for_timeout(100 if min(t["next"] for t in tabs) - time.time() > 0.1 else 20)
                 continue
-            # The day is open: every other tab still showing the old calendar reloads right away.
-            for o in tabs:
-                if o not in ready:
-                    fire(o, time.time())
-            if ready[0] is not next(t for t in tabs if t["alive"]):
-                # A lower choice opened first; give better choices still reloading a moment to catch up.
-                first.wait_for_timeout(250)
-                ready = [t for t in tabs if t["alive"] and is_ready(t)] or ready
-            t = ready[0]  # the best choice that is open right now
+            t, speculative = pick_tab(tabs, ready, already_open, time.time() + offset,
+                                      open_at.timestamp(), spec_done, book_on_open)
+            if speculative:
+                spec_done = True
+                try:
+                    # Stop late start-time answers from putting a Book button over Confirm and OK.
+                    t["page"].evaluate("() => { if (window.__cbList) window.__cbList.state = 'ready'; }")
+                except Exception:
+                    pass
+            else:
+                # The day is open: every other tab still showing the old calendar reloads right away.
+                for o in tabs:
+                    if o not in ready:
+                        fire(o, time.time())
+                if ready[0] is not next(t for t in tabs if t["alive"]):
+                    # A lower choice opened first; give better choices still reloading a moment to catch up.
+                    first.wait_for_timeout(250)
+                    ready = [t for t in tabs if t["alive"] and is_ready(t)] or ready
+                t = ready[0]  # the best choice that is open right now
             try:
                 t["page"].bring_to_front()  # a tab in front is not slowed down by the browser
                 steps_timed = []
@@ -689,14 +731,17 @@ def race_booking(settings, password, recipe, day, slot, open_at, dry_run=False):
                                   message=f"Midnight mode dry run: {t['label']} was free {when}. Nothing was booked.{before}{timing}")
                 else:
                     result.update(room=t["room"], time=t["time"], status="booked", screenshot=shot,
-                                  message=f"Midnight mode booked {t['label']} {when}{sent}.{before}{timing}")
+                                  message=f"Midnight mode booked {t['label']} {when}{sent}."
+                                          + (" Booked on the first sign the day was open." if speculative else "")
+                                          + f"{before}{timing}")
                 browser.close()
                 return result
             except StepFailed as e:
                 # No screenshot here: it costs about a second, and the next choice is waiting.
                 t["alive"] = False
                 t["failed"] = e.outcome
-                notes.append(f"{t['label']} " + (f"was taken by someone else (seen {_when()})"
+                notes.append(f"{t['label']} " + ("(booked on the first sign of opening) " if speculative else "")
+                             + (f"was taken by someone else (seen {_when()})"
                                                  if e.outcome == "unavailable"
                                                  else f"failed at '{_step_label(e)}' {_when()}"))
         if notes:

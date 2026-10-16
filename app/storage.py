@@ -54,6 +54,7 @@ DEFAULT_SETTINGS = {
     "race_lead_seconds": 150,    # how early to sign in and get the forms ready
     "race_window_seconds": 120,  # how long to keep checking after the open time
     "race_poll_ms": 1500,        # how often each ready form re-checks the calendar
+    "race_book_on_open": True,   # book the top choice on the first sign the day is open (false = wait for its own answer)
     "show_browser": False,
     "paused": True,         # new installs start paused; the setup guide's last step turns it on
 }
