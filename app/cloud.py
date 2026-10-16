@@ -74,7 +74,22 @@ def settings_from_env():
         return None, None, "No rooms. Fill in the Rooms column in the sheet, or set the ROOMS variable."
     # A ROOMS override (variable or Run workflow box) wins over each day's rooms in the plan.
     s["slots"] = [dict(x, enabled=True, **({"rooms": []} if rooms else {})) for x in me["slots"]]
+    s["team_mains"] = team_mains(plan, user)
     return s, password, None
+
+
+def team_mains(plan, user):
+    """Everyone else's main choice per day: {"Mon": [[room, start, end], ...]}. Their first room
+    that day (or their first room overall) at their main time."""
+    out = {}
+    for p in plan.get("people", []):
+        if p.get("username", "").lower() == user.lower():
+            continue
+        for slot in p.get("slots", []):
+            rooms = slot.get("rooms") or p.get("rooms") or plan.get("rooms") or []
+            if rooms and slot.get("day"):
+                out.setdefault(slot["day"], []).append([rooms[0], slot["start"], slot["end"]])
+    return out
 
 
 def slot_for(s, day):

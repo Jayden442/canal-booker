@@ -5,5 +5,6 @@
   "open_time": "00:00",
   "book_times": ["00:05"],
   "retry_every_seconds": 30,
-  "status_url": "https://script.google.com/macros/s/AKfycbzieC3l04q5tRsI8H7c124uHVr4rEFFTMkDafW8qs-9HiPVhnJcVHD62fCPg2c4jmSk/exec"
+  "status_url": "https://script.google.com/macros/s/AKfycbzieC3l04q5tRsI8H7c124uHVr4rEFFTMkDafW8qs-9HiPVhnJcVHD62fCPg2c4jmSk/exec",
+  "race_book_on_open": true
 }
